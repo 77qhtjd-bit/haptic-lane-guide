@@ -40,6 +40,19 @@ export const DEFAULT_TRACKER_CONFIG = {
   maxCurvature: 0.1, // 1/m (10 m radius): anything sharper is a bad fit, not a track
   widthAlpha: 0.05, // lane width adapts slowly, only when both lines are seen
   coastFrames: 30, // ~1s at 30fps without a matched line, then 'lost'
+  // While coasting the lane offset keeps its last rate, decayed each frame: jogging sway makes that
+  // rate noisy, and integrating it undecayed walked the lane away from the real lines.
+  coastRateDecay: 0.7,
+  // Inside <-> outside only after this many consecutive frames agree, and never on coasting
+  // frames alone (a drifting prediction is not evidence that the runner left the lane).
+  statusFrames: 5,
+  // The detector re-aligns its ground frame to the lane every frame (heading search), so in that
+  // frame the lane's slope at the runner stays near 0. Re-expressing the previous slope through the
+  // frame-to-frame heading change counted the rotation twice: with jogging heading jitter (±8°/frame)
+  // the predicted slope reached ~20°, the predicted line missed the real one by ~40 cm at 1.5 m,
+  // and the lane coasted to LOST. The previous slope is carried over; while coasting (no line
+  // matched last frame) it decays by slopeDecay per frame toward the aligned frame's 0.
+  slopeDecay: 0.5,
 };
 
 export const LaneStatus = Object.freeze({
@@ -67,6 +80,9 @@ export class LaneTracker {
     this.missed = 0;
     this.polylines = { left: [], right: [] };
     this.last = { status: LaneStatus.UNLOCKED };
+    this.shownStatus = LaneStatus.INSIDE; // debounced inside/outside status
+    this.pendingStatus = null;
+    this.pendingFrames = 0;
   }
 
   // The lane a Lock would take right now, or null: in the nearest segment that shows a line on each
@@ -157,8 +173,8 @@ export class LaneTracker {
     if (this.last.status === LaneStatus.LOST) return this.last;
 
     const { gate, gateGrowthPerFrame, segmentGate, alpha, beta, shapeAlpha, maxCurvature, widthAlpha, coastFrames } = this.cfg;
-    // Re-express the previous slope in this frame's rotation.
-    const slope = Math.tan(Math.atan(this.slope) + this.heading - heading);
+    // Previous slope, in the detector's lane-aligned frame (see slopeDecay).
+    const slope = this.missed > 0 ? this.slope * this.cfg.slopeDecay : this.slope;
     const predicted = this.center + this.centerRate;
     const half = this.width / 2;
     const g = Math.min(gate + this.missed * gateGrowthPerFrame, 0.45 * this.width);
@@ -186,7 +202,8 @@ export class LaneTracker {
     this.polylines = { left: leftChain, right: rightChain };
 
     if (obs.length === 0) {
-      this.center = predicted;
+      this.centerRate *= this.cfg.coastRateDecay;
+      this.center = this.center + this.centerRate;
       this.slope = slope;
       this.heading = heading;
       this.missed++;
@@ -194,7 +211,7 @@ export class LaneTracker {
         this.last = { ...this.output({ left: false, right: false }, 0), status: LaneStatus.LOST };
         return this.last;
       }
-      this.last = this.output(matched, Math.max(0, 0.5 * (1 - this.missed / coastFrames)));
+      this.last = this.debounced(this.output(matched, Math.max(0, 0.5 * (1 - this.missed / coastFrames))), false);
       return this.last;
     }
 
@@ -215,8 +232,26 @@ export class LaneTracker {
     this.missed = 0;
     const segmentsSeen = new Set(obs.map((o) => o.x)).size;
     const confidence = matched.left && matched.right ? 1 : segmentsSeen >= 2 ? 0.7 : 0.6;
-    this.last = this.output(matched, confidence);
+    this.last = this.debounced(this.output(matched, confidence), true);
     return this.last;
+  }
+
+  // Applies the inside/outside debounce to an output. observed: at least one line matched this frame.
+  debounced(out, observed) {
+    const raw = out.status;
+    if (raw === this.shownStatus) {
+      this.pendingStatus = null;
+      this.pendingFrames = 0;
+    } else if (observed) {
+      if (raw === this.pendingStatus) this.pendingFrames++;
+      else { this.pendingStatus = raw; this.pendingFrames = 1; }
+      if (this.pendingFrames >= this.cfg.statusFrames) {
+        this.shownStatus = raw;
+        this.pendingStatus = null;
+        this.pendingFrames = 0;
+      }
+    }
+    return { ...out, status: this.shownStatus, rawStatus: raw };
   }
 
   output(matched, confidence) {

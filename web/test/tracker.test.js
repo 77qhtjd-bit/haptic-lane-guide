@@ -181,3 +181,29 @@ test('sliding window follows a lane that bends away and keeps the lines when one
   close(out.eY, 0, 0.02);
   close(out.ePsi, -Math.atan(0.08), 0.02); // lane points right of the runner
 });
+
+test('jogging heading jitter does not bend the predicted lane off the lines (slope is not re-rotated)', () => {
+  // The detector re-aligns to the lane every frame, so the peaks stay straight in its frame while
+  // the reported heading jitters by ±8 degrees from frame to frame, as measured while jogging.
+  const t = new LaneTracker();
+  assert.ok(t.lock([], 0, segmentsFor(0)));
+  let out;
+  for (let i = 0; i < 30; i++) {
+    const heading = (i % 2 ? 1 : -1) * 0.14;
+    out = t.update([], heading, segmentsFor(0));
+    assert.ok(out.matched.left && out.matched.right, `frame ${i}: both lines matched`);
+  }
+  close(out.eY, 0, 0.02);
+  assert.equal(out.status, LaneStatus.INSIDE);
+});
+
+test('inside/outside changes only after statusFrames observed frames, not on coasting frames', () => {
+  const t = new LaneTracker();
+  assert.ok(t.lock([], 0, segmentsFor(0)));
+  // Runner steps 0.8 m to the right: right line now left of the runner.
+  const crossed = segmentsFor(0.8);
+  for (let i = 0; i < t.cfg.statusFrames - 1; i++) assert.equal(t.update([], 0, crossed).status, LaneStatus.INSIDE);
+  // Frames with no lines at all never flip the status, however the prediction drifts.
+  const empty = crossed.map((s) => ({ ...s, peaks: [] }));
+  for (let i = 0; i < 10; i++) assert.equal(t.update([], 0, empty).status, LaneStatus.INSIDE);
+});
