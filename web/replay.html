@@ -27,6 +27,7 @@
   <button id="play" disabled>Play</button>
   <button id="lockBtn" disabled>Lock lane</button>
   <button id="restart" disabled>Restart</button>
+  <button id="stepBtn" disabled>Step all frames</button>
   <label>speed <select id="speed"><option>0.25</option><option>0.5</option><option selected>1</option><option>2</option></select></label>
   <label><input type="checkbox" id="autolock" checked> auto lock / re-lock after lost</label>
   <button id="csv" disabled>Download CSV</button>
@@ -63,7 +64,7 @@ import { HapticController } from './control/controller.js';
 import { commandToLevels } from './control/protocol.js';
 import { candidateLane, cueText, drawView, drawBev } from './lane/draw.js';
 
-const PAGE_VERSION = 'replay-1';
+const PAGE_VERSION = "replay-2";
 const $ = (id) => document.getElementById(id);
 const log = (msg) => { $('log').textContent = `${msg}\n` + $('log').textContent; };
 window.addEventListener('error', (e) => log(`error: ${e.message}`));
@@ -162,7 +163,7 @@ async function loadFiles(videoBlob, json) {
   await new Promise((r) => video.addEventListener('loadedmetadata', r, { once: true }));
   setupCanvases();
   resetPipeline();
-  for (const id of ['play', 'lockBtn', 'restart', 'csv', 'sumBtn']) $(id).disabled = false;
+  for (const id of ['play', 'lockBtn', 'restart', 'csv', 'sumBtn', 'stepBtn']) $(id).disabled = false;
   log(`loaded ${rec.name}: video ${video.videoWidth}x${video.videoHeight}, ${video.duration.toFixed(1)} s`);
 }
 
@@ -303,6 +304,29 @@ function processFrame(mediaTime) {
 // ---------- Summary ----------
 const median = (a) => { if (!a.length) return NaN; const s = [...a].sort((x, y) => x - y); return s[s.length >> 1]; };
 const pct = (a, p) => { if (!a.length) return NaN; const s = [...a].sort((x, y) => x - y); return s[Math.min(s.length - 1, Math.floor(p * s.length))]; };
+// Ground truth (?out=94-97,103-110): seconds when the runner was outside the lane; all other time is
+// inside. Frames within TRUTH_MARGIN_S of a transition are not scored.
+const TRUTH_MARGIN_S = 1;
+const truthOut = (params.get('out') || '').split(',').filter(Boolean).map((r) => r.split('-').map(Number));
+function scoreTruth() {
+  if (!truthOut.length) return null;
+  const near = (t) => truthOut.some(([a, b]) => Math.abs(t - a) < TRUTH_MARGIN_S || Math.abs(t - b) < TRUTH_MARGIN_S);
+  const isOut = (t) => truthOut.some(([a, b]) => t > a && t < b);
+  const inF = rows.filter((r) => !near(r.t_s) && !isOut(r.t_s));
+  const outF = rows.filter((r) => !near(r.t_s) && isOut(r.t_s));
+  const share = (rs, f) => (rs.length ? (100 * rs.filter(f).length) / rs.length : NaN);
+  const outside = (r) => r.status === LaneStatus.OUTSIDE_LEFT || r.status === LaneStatus.OUTSIDE_RIGHT;
+  return {
+    intervals_out_s: truthOut,
+    inside_truth_frames: inF.length,
+    inside_correct_pct: share(inF, (r) => r.status === LaneStatus.INSIDE),
+    inside_false_outside_pct: share(inF, outside),
+    inside_lost_or_unlocked_pct: share(inF, (r) => r.status === LaneStatus.LOST || r.status === LaneStatus.UNLOCKED),
+    inside_line_seen_pct: share(inF, (r) => r.matched !== ''),
+    out_truth_frames: outF.length,
+    out_detected_pct: share(outF, outside),
+  };
+}
 function summarize() {
   const n = rows.length;
   const count = (st) => rows.filter((r) => r.status === st).length;
@@ -336,6 +360,7 @@ function summarize() {
     height_estimate_m: median(heights),
     proc_ms: { median: median(rows.map((r) => r.proc_ms)), p95: pct(rows.map((r) => r.proc_ms), 0.95) },
     not_ok_reasons: reasons,
+    truth: scoreTruth(),
   };
 }
 function showSummary() {
@@ -350,6 +375,7 @@ function showSummary() {
     `eY step/frame (cm) median ${f(s.eY_step_cm.median, 2)}  p95 ${f(s.eY_step_cm.p95, 2)}`,
     `lane width (cm) median ${f(s.lane_width_cm.median)}  p5 ${f(s.lane_width_cm.p5)}  p95 ${f(s.lane_width_cm.p95)}`,
     `height estimate ${f(s.height_estimate_m, 2)} m   process ${f(s.proc_ms.median, 1)} / ${f(s.proc_ms.p95, 1)} ms`,
+    s.truth ? `TRUTH inside-time: correct ${f(s.truth.inside_correct_pct)}%  false outside ${f(s.truth.inside_false_outside_pct)}%  lost ${f(s.truth.inside_lost_or_unlocked_pct)}%  line seen ${f(s.truth.inside_line_seen_pct)}% | outside-time detected ${f(s.truth.out_detected_pct)}%` : '',
   ].join('\n');
   return s;
 }
@@ -384,8 +410,35 @@ function toCsv() {
   const cols = Object.keys(rows[0]);
   return [cols.join(','), ...rows.map((r) => cols.map((c) => r[c]).join(','))].join('\n');
 }
+$('stepBtn').onclick = () => stepAll();
 $('csv').onclick = () => download(`${rec.name}_replay.csv`, toCsv(), 'text/csv');
 $('sumBtn').onclick = () => download(`${rec.name}_replay_summary.json`, JSON.stringify(summarize(), null, 2), 'application/json');
+
+// Step mode (?step=1 or the Step all button): seek through the clip one frame at a time and process
+// every frame, so results do not depend on playback speed or machine load.
+function nextPresentedFrame() {
+  return new Promise((resolve) => {
+    let done = false;
+    video.requestVideoFrameCallback((now, md) => { if (!done) { done = true; resolve(md.mediaTime); } });
+    video.addEventListener('seeked', () => setTimeout(() => { if (!done) { done = true; resolve(video.currentTime); } }, 200), { once: true });
+  });
+}
+async function stepAll() {
+  video.pause();
+  resetPipeline();
+  const dt = 1 / 30;
+  for (let t = dt / 2; t < video.duration; t += dt) {
+    video.currentTime = t;
+    const mt = await nextPresentedFrame();
+    if (mt !== lastMediaTime) {
+      lastMediaTime = mt;
+      try { processFrame(mt); } catch (e) { log(`frame error: ${e.message}`); }
+    }
+  }
+  showSummary();
+  window.replayDone = true;
+  log('step mode: end of clip');
+}
 
 // Exposed for headless runs.
 window.replayApi = { summarize, toCsv, get rows() { return rows; } };
@@ -402,7 +455,8 @@ loadCv().then(async ({ cv: m }) => {
   if (base) {
     await loadFromUrl(base);
     if (params.get('speed')) $('speed').value = params.get('speed');
-    if (params.get('auto')) { video.playbackRate = +$('speed').value; video.play(); }
+    if (params.get('step')) stepAll();
+    else if (params.get('auto')) { video.playbackRate = +$('speed').value; video.play(); }
   }
 });
 </script>
