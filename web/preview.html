@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Live Preview</title>
+<style>
+  body { margin: 0; padding: 10px; background: #000; color: #fff; font: 20px/1.4 -apple-system, system-ui, sans-serif; }
+  input, button { font-size: 30px; padding: 14px; margin: 4px 0; width: 100%; box-sizing: border-box; border-radius: 10px; border: 0; }
+  input { text-align: center; letter-spacing: 8px; }
+  button { background: #0a84ff; color: #fff; }
+  video { width: 100%; height: 72vh; background: #111; object-fit: contain; margin-top: 6px; }
+  .v { font-weight: 700; font-variant-numeric: tabular-nums; }
+  #errors { color: #ff453a; font-size: 16px; white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<!-- Viewer for the live preview shared by web/record.html (WebRTC via PeerJS signaling). -->
+<input id="code" inputmode="numeric" maxlength="4" placeholder="4-digit code">
+<button id="go">Watch</button>
+<div>Status: <span class="v" id="status">-</span> &nbsp; <span class="v" id="fps"></span></div>
+<video id="video" playsinline muted autoplay></video>
+<p style="font-size:15px;color:#888">If it stays on "connecting", join the recording phone's Personal Hotspot and try again.
+Page version: <span id="ver"></span></p>
+<div id="errors"></div>
+<script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js"></script>
+<script>
+"use strict";
+const PAGE_VERSION = "preview-1";
+const ICE_SERVERS = [{ urls: "stun:stun.l.google.com:19302" }];   // keep in sync with record.html
+const $ = (id) => document.getElementById(id);
+$("ver").textContent = PAGE_VERSION;
+function err(msg) { $("errors").textContent = new Date().toLocaleTimeString() + " " + msg + "\n" + $("errors").textContent.slice(0, 500); }
+const status = (t) => { $("status").textContent = t; };
+const video = $("video");
+let peer = null, frames = 0;
+
+$("go").onclick = () => {
+  const code = $("code").value.trim();
+  if (!/^\d{4}$/.test(code)) { status("enter the 4-digit code"); return; }
+  if (typeof Peer === "undefined") { status("PeerJS not loaded (no internet?)"); return; }
+  if (peer) peer.destroy();
+  if ("wakeLock" in navigator) navigator.wakeLock.request("screen").catch(() => {});
+  status("connecting...");
+  peer = new Peer(undefined, { config: { iceServers: ICE_SERVERS } });
+  peer.on("open", () => {
+    const conn = peer.connect("hlg-rec-" + code);
+    conn.on("open", () => status("waiting for video..."));
+    conn.on("close", () => status("recording phone stopped sharing"));
+  });
+  // The recording phone calls back with its camera stream.
+  peer.on("call", (call) => {
+    call.answer();
+    call.on("stream", (s) => { video.srcObject = s; video.play().catch(() => {}); status("live"); });
+    call.on("close", () => status("disconnected - tap Watch to retry"));
+    const pc = call.peerConnection;
+    pc.addEventListener("connectionstatechange", () => {
+      if (pc.connectionState === "failed") status("connection failed - try the Personal Hotspot, then Watch");
+      if (pc.connectionState === "disconnected") status("connection lost...");
+      if (pc.connectionState === "connected") status("live");
+    });
+  });
+  peer.on("error", (e) => {
+    if (e.type === "peer-unavailable") status("code not found - is sharing on?");
+    else { status("error: " + e.type); err(e.type + " " + (e.message || "")); }
+  });
+};
+
+// Received frame rate, to see if the preview is flowing.
+function countFrame() { frames++; video.requestVideoFrameCallback(countFrame); }
+if ("requestVideoFrameCallback" in HTMLVideoElement.prototype) video.requestVideoFrameCallback(countFrame);
+setInterval(() => {
+  if (video.srcObject) $("fps").textContent = `${frames} fps ${video.videoWidth}x${video.videoHeight}`;
+  frames = 0;
+}, 1000);
+</script>
+</body>
+</html>

@@ -46,6 +46,8 @@
 <div id="hint"></div>
 <button id="save" disabled>Save to phone</button>
 <div id="links"></div>
+<button id="share">Share live preview (another phone)</button>
+<div id="sharecode" style="font-size:44px;font-weight:700;text-align:center;letter-spacing:6px"></div>
 
 <div class="row"><span>Elapsed / max</span><span class="v" id="elapsed">-</span></div>
 <div class="row"><span>File size (est.)</span><span class="v" id="size">-</span></div>
@@ -56,13 +58,16 @@
 <div class="row"><span>Recorder format</span><span class="v" id="mime">-</span></div>
 <div class="row"><span>Save method</span><span class="v" id="method">-</span></div>
 <div class="row"><span>Wake lock</span><span class="v" id="wake">-</span></div>
+<div class="row"><span>Live preview</span><span class="v" id="preview">off</span></div>
 <video id="video" playsinline muted autoplay></video>
 <p style="font-size:16px;color:#888">Page version: <span id="ver"></span></p>
 <div id="errors"></div>
 
+<!-- PeerJS: WebRTC helper + free public signaling server (only used to connect the two phones). -->
+<script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js"></script>
 <script>
 "use strict";
-const PAGE_VERSION = "record-1";
+const PAGE_VERSION = "record-2";
 const now = () => performance.timeOrigin + performance.now();   // same clock as all other pages
 const $ = (id) => document.getElementById(id);
 $("ver").textContent = PAGE_VERSION;
@@ -114,6 +119,10 @@ async function openCamera(deviceId) {
   await video.play().catch((e) => err("video.play: " + e.message));
   const st = track.getSettings();
   $("settings").textContent = `${track.label || "?"} ${st.width}x${st.height}@${st.frameRate}`;
+  for (const call of previewCalls) {   // keep the live preview on the new camera
+    const sender = call.peerConnection && call.peerConnection.getSenders().find((x) => x.track && x.track.kind === "video");
+    if (sender) sender.replaceTrack(track).catch((e) => err("preview replaceTrack: " + e.message));
+  }
 }
 $("cam").onchange = () => openCamera($("cam").value).catch((e) => err("camera: " + e.message));
 
@@ -234,6 +243,58 @@ $("save").onclick = async () => {
     $("hint").textContent = "Not saved yet. Tap Save again, or use the download links.";
   }
 };
+
+// ---------- Live preview for another phone (WebRTC) ----------
+// The phone shows a 4-digit code; web/preview.html on the other phone connects with it, then this
+// phone sends the camera stream at reduced quality. Recording itself is unaffected (separate path).
+// If phones on cellular cannot connect, put the viewer phone on this phone's Personal Hotspot.
+const ICE_SERVERS = [{ urls: "stun:stun.l.google.com:19302" }];   // add a TURN server here if needed
+const PREVIEW_ENCODING = { maxBitrate: 400000, scaleResolutionDownBy: 2, maxFramerate: 15 };
+let peer = null, previewCalls = [];
+if (typeof Peer === "undefined") { $("share").disabled = true; $("share").textContent = "Live preview unavailable (PeerJS not loaded)"; }
+
+function previewEvent(ev) { if (rec) rec.events.push([Math.round(now() - rec.rec_start_t), "preview:" + ev]); }
+function updatePreview(text) { $("preview").textContent = text || (previewCalls.length ? `${previewCalls.length} viewer(s)` : "waiting for viewer"); }
+
+$("share").onclick = () => {
+  if (!stream) { err("Start the camera first"); return; }
+  if (!peer) startShare();
+};
+function startShare() {
+  const code = String(Math.floor(1000 + Math.random() * 9000));
+  peer = new Peer("hlg-rec-" + code, { config: { iceServers: ICE_SERVERS } });
+  updatePreview("connecting to signaling...");
+  peer.on("open", () => { $("sharecode").textContent = code; updatePreview(); });
+  peer.on("connection", (conn) => conn.on("open", () => callViewer(conn.peer)));
+  peer.on("disconnected", () => { updatePreview("signaling lost, retrying"); peer.reconnect(); });
+  peer.on("error", (e) => {
+    if (e.type === "unavailable-id") { peer.destroy(); peer = null; startShare(); return; }   // code taken: new code
+    err("preview: " + e.type);
+    updatePreview("error: " + e.type);
+  });
+}
+function callViewer(id) {
+  const call = peer.call(id, stream);
+  previewCalls.push(call);
+  previewEvent("viewer joined");
+  updatePreview();
+  const pc = call.peerConnection;
+  pc.addEventListener("connectionstatechange", () => {
+    if (pc.connectionState === "connected") { limitPreview(pc); updatePreview(); }
+    if (pc.connectionState === "failed") updatePreview("viewer connection failed (try Personal Hotspot)");
+  });
+  call.on("close", () => { previewCalls = previewCalls.filter((c) => c !== call); previewEvent("viewer left"); updatePreview(); });
+  call.on("error", (e) => err("preview call: " + e));
+}
+async function limitPreview(pc) {
+  for (const sender of pc.getSenders()) {
+    if (!sender.track || sender.track.kind !== "video") continue;
+    const p = sender.getParameters();
+    if (!p.encodings || !p.encodings.length) p.encodings = [{}];
+    Object.assign(p.encodings[0], PREVIEW_ENCODING);
+    try { await sender.setParameters(p); } catch (e) { err("preview limit: " + e.message); }
+  }
+}
 
 // ---------- Status ----------
 setInterval(() => {
