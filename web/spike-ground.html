@@ -34,7 +34,6 @@
 <button id="start">Start (camera + motion)</button>
 <button id="lock" hidden>Lock lane</button>
 <button id="connect">Connect belt (BLE: LaneActuator)</button>
-<label><input type="checkbox" id="sim"> Simulate lane: tilt the phone left/right = drift left/right (no lane needed)</label>
 <div id="status"></div>
 <div id="motors"><div>1</div><div>2</div><div>3</div><div>4</div><div>5</div></div>
 <div id="runs">
@@ -80,7 +79,7 @@
 <script async src="./vendor/opencv.js"></script>
 <script type="module">
 import { GroundLineDetector, DEFAULT_CONFIG } from './lane/detector.js';
-import { AttitudeBuffer, upFromOrientation, deviceToCamera, groundToPixel, LANE_WIDTH_M } from './lane/ground.js';
+import { AttitudeBuffer, upFromOrientation, deviceToCamera, groundToPixel } from './lane/ground.js';
 import { LaneTracker, LaneStatus } from './lane/tracker.js';
 import { LaneEstimator, yawRateFromMotion } from './control/estimator.js';
 import { HapticController, Pattern } from './control/controller.js';
@@ -317,9 +316,7 @@ function run(cv, video) {
     const res = detector.process(rgba, up, prevHeading);
     rgba.delete();
     latest = res;
-    const lane = $('sim').checked
-      ? simulatedLane(upDevice ? rollDeg(upDevice) : +$('mgamma').value)
-      : tracker.update(res.ok ? res.peaks : [], res.ok ? res.heading : tracker.heading);
+    const lane = tracker.update(res.ok ? res.peaks : [], res.ok ? res.heading : tracker.heading);
     // Once locked, the lane's own heading is the better prior than whatever the last frame found.
     if (tracker.locked && lane.status !== LaneStatus.LOST) prevHeading = lane.heading;
     else prevHeading = res.ok && res.peaks.length ? res.heading : 0;
@@ -408,25 +405,6 @@ function run(cv, video) {
     else requestAnimationFrame(frame);
   };
   frame();
-}
-
-// Left/right tilt of an upright phone, from gravity (gamma itself is unstable near upright).
-// + = top of the phone tilted to the right.
-const rollDeg = (up) => (Math.atan2(-up[0], up[1]) * 180) / Math.PI;
-
-// Simulation for testing the belt and practicing the cues without a lane: phone roll of
-// +-30 degrees maps to +-0.6 m of drift (+ = tilted right = runner right of center).
-function simulatedLane(gammaDeg) {
-  const eY = Math.max(-1.2, Math.min(1.2, (gammaDeg / 30) * 0.6));
-  const half = LANE_WIDTH_M / 2;
-  const center = -eY;
-  let status = LaneStatus.INSIDE;
-  if (center - half > 0) status = LaneStatus.OUTSIDE_LEFT;
-  else if (center + half < 0) status = LaneStatus.OUTSIDE_RIGHT;
-  return {
-    status, eY, ePsi: 0, center, leftY: center - half, rightY: center + half, width: LANE_WIDTH_M,
-    heading: 0, matched: { left: true, right: true }, confidence: 1,
-  };
 }
 
 // Mirrors the belt on screen: each box shows its motor's level and blinks with the 60 ms pulses

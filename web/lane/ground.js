@@ -194,30 +194,48 @@ function gaussianSmooth(hist, sigmaBins) {
   return out;
 }
 
-// Peaks of the lateral histogram: [{ y, strength }] sorted by y (left to right).
+// Peaks of the lateral histogram: [{ y, strength, width }] sorted by y (left to right).
 // minSeparation keeps the two edges of one 5cm line from becoming two peaks.
-export function findPeaks(H, { sigma = 0.03, minSeparation = 0.6, minFraction = 0.2, minCount = 3 } = {}) {
+// maxWidth rejects broad humps: a painted line is a few cm wide, while a white floor, wall base or
+// bright patch spreads over tens of cm. minFraction is taken relative to the strongest narrow peak,
+// so a big bright area cannot raise the bar and hide the real lines.
+export function findPeaks(
+  H,
+  { sigma = 0.03, minSeparation = 0.6, minFraction = 0.2, minCount = 3, maxWidth = 0.25 } = {},
+) {
   const { bin, yHalf } = H;
   const s = gaussianSmooth(H.hist, sigma / bin);
-  let max = 0;
-  for (const v of s) max = Math.max(max, v);
-  const threshold = Math.max(minFraction * max, minCount / (sigma / bin));
-  const candidates = [];
+  const floor = minCount / (sigma / bin);
+  const narrow = [];
   for (let i = 1; i < s.length - 1; i++) {
-    if (s[i] >= threshold && s[i] > s[i - 1] && s[i] >= s[i + 1]) candidates.push(i);
+    if (s[i] < floor || !(s[i] > s[i - 1] && s[i] >= s[i + 1])) continue;
+    const width = halfMaxWidth(s, i) * bin;
+    if (width <= maxWidth) narrow.push({ i, width });
   }
-  candidates.sort((a, b) => s[b] - s[a]);
+  let max = 0;
+  for (const c of narrow) max = Math.max(max, s[c.i]);
+  const candidates = narrow.filter((c) => s[c.i] >= minFraction * max).sort((a, b) => s[b.i] - s[a.i]);
   const kept = [];
-  for (const i of candidates) {
-    if (kept.every((j) => Math.abs(i - j) * bin >= minSeparation)) kept.push(i);
+  for (const c of candidates) {
+    if (kept.every((k) => Math.abs(c.i - k.i) * bin >= minSeparation)) kept.push(c);
   }
   return kept
-    .map((i) => {
+    .map(({ i, width }) => {
       const denom = s[i - 1] - 2 * s[i] + s[i + 1];
       const offset = denom < 0 ? (0.5 * (s[i - 1] - s[i + 1])) / denom : 0;
-      return { y: (i + 0.5 + offset) * bin - yHalf, strength: s[i] };
+      return { y: (i + 0.5 + offset) * bin - yHalf, strength: s[i], width };
     })
     .sort((a, b) => a.y - b.y);
+}
+
+// Full width at half maximum around index i, in bins.
+function halfMaxWidth(s, i) {
+  const half = s[i] / 2;
+  let l = i;
+  while (l > 0 && s[l - 1] > half) l--;
+  let r = i;
+  while (r < s.length - 1 && s[r + 1] > half) r++;
+  return r - l + 1;
 }
 
 // Ground coordinates scale linearly with h, and the lane width is known, so the spacing of

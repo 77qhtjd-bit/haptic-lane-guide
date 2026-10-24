@@ -20,6 +20,7 @@ export const DEFAULT_CONFIG = {
   whiteVMin: 180, // HSV value floor for white paint
   whiteSMax: 60, // HSV saturation ceiling (red/blue track surface is saturated)
   openKernel: 3, // morphological open removes speckle
+  maxLineWidthPx: 7, // top-hat: white runs wider than this (walls, white floor, lights) are not lines
   maxPoints: 4000,
   band: { xMin: 1, xMax: 4, yHalf: 3, bin: 0.02 },
   peaks: { sigma: 0.03, minSeparation: 0.6, minFraction: 0.2, minCount: 3 },
@@ -36,6 +37,7 @@ export class GroundLineDetector {
     this.hsv = new cv.Mat();
     this.mask = new cv.Mat();
     this.kernel = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(this.cfg.openKernel, this.cfg.openKernel));
+    this.lineKernel = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(this.cfg.maxLineWidthPx, 1));
     this.setThresholds(this.cfg.whiteVMin, this.cfg.whiteSMax);
     this.pixels = new Float32Array(this.cfg.maxPoints * 2);
   }
@@ -59,6 +61,9 @@ export class GroundLineDetector {
     cv.cvtColor(this.rgb, this.hsv, cv.COLOR_RGB2HSV);
     cv.inRange(this.hsv, this.low, this.high, this.mask);
     cv.morphologyEx(this.mask, this.mask, cv.MORPH_OPEN, this.kernel);
+    // Keep only thin white structures: top-hat = mask minus its opening with a wide horizontal kernel.
+    // Track lines are 2-4 px wide at this resolution; wide bright areas vanish.
+    cv.morphologyEx(this.mask, this.mask, cv.MORPH_TOPHAT, this.lineKernel);
 
     const basis = upCam && groundBasis(upCam);
     if (!basis) return { ok: false, reason: upCam ? 'camera-vertical' : 'no-attitude' };
@@ -102,6 +107,6 @@ export class GroundLineDetector {
   }
 
   delete() {
-    for (const m of [this.rgb, this.hsv, this.mask, this.kernel, this.low, this.high]) m.delete();
+    for (const m of [this.rgb, this.hsv, this.mask, this.kernel, this.lineKernel, this.low, this.high]) m.delete();
   }
 }
