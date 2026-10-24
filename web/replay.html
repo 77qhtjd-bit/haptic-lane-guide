@@ -101,8 +101,11 @@ let rows = [];                 // per-frame log
 let lastMediaTime = -1;
 let lockEvents = 0, lostEvents = 0, prevStatus = LaneStatus.UNLOCKED, lostSince = null;
 
+// Tracker settings for experiments: ?t_gate=0.35&t_segmentGate=0.2&t_coastFrames=45 ... (any DEFAULT_TRACKER_CONFIG key).
+const trackerOverrides = {};
+for (const [k, v] of new URLSearchParams(location.search)) if (k.startsWith('t_')) trackerOverrides[k.slice(2)] = +v;
 function resetPipeline() {
-  tracker = new LaneTracker();
+  tracker = new LaneTracker(trackerOverrides);
   estimator = new LaneEstimator();
   controller = new HapticController();
   attitude = new AttitudeBuffer();
@@ -272,6 +275,11 @@ function processFrame(mediaTime) {
     imu_age_ms: Number.isFinite(imuAgeMs) ? Math.round(imuAgeMs) : '',
     beta: lastOrientation?.beta ?? '', gamma: lastOrientation?.gamma ?? '',
     height_est_m: res.heightEstimate ?? '', mask_px: res.maskPixels ?? '', proc_ms: +procMs.toFixed(2),
+    // Diagnostics: what the detector offered the tracker this frame.
+    det_peaks: res.ok ? res.peaks.length : 0,
+    det_segments_with_peaks: res.ok && res.segments ? res.segments.filter((g) => g.peaks && g.peaks.length).length : 0,
+    det_heading_deg: res.ok ? +((res.heading * 180) / Math.PI).toFixed(2) : '',
+    near_peak_y: res.ok && res.peaks.length ? res.peaks.map((p) => p.y.toFixed(2)).join(' ') : '',
     reason: res.ok ? '' : res.reason,
   });
 
@@ -313,7 +321,7 @@ function summarize() {
   for (const r of rows) if (r.reason) reasons[r.reason] = (reasons[r.reason] || 0) + 1;
   return {
     page_version: PAGE_VERSION, clip: rec?.name, memo: rec?.memo,
-    settings: { h: +$('h').value, hfov: +$('hfov').value, vmin: +$('vmin').value, smax: +$('smax').value,
+    settings: { tracker: trackerOverrides, h: +$('h').value, hfov: +$('hfov').value, vmin: +$('vmin').value, smax: +$('smax').value,
                 lag_ms: +$('lag').value, lane_min: +$('laneMin').value, lane_max: +$('laneMax').value, autolock: $('autolock').checked },
     frames_processed: n, frames_in_clip: rec?.frames?.length ?? null,
     locked_pct: n ? (100 * locked.length) / n : 0,
