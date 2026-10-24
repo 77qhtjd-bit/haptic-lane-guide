@@ -76,6 +76,16 @@ export const DEFAULT_TRACKER_CONFIG = {
   verifyHalfLen: 0.4,
   verifyBand: 0.1,
   verifyMinPoints: 8,
+  // Fill: when peaks gave no chain for a side, trace that line through the ground points from where
+  // it is predicted, in traceStep steps with a ±traceWindow window, the direction changing at most
+  // traceMaxTurn (slope) per step; traceMisses empty steps end it. The trace is used if it covers
+  // traceMinLength meters (0 = off).
+  traceMinLength: 1.5,
+  traceStep: 0.25,
+  traceWindow: 0.07,
+  traceMaxTurn: 0.05,
+  traceMisses: 3,
+  traceMinPoints: 4,
 };
 
 export const LaneStatus = Object.freeze({
@@ -257,6 +267,10 @@ export class LaneTracker {
       leftChain = this.verifyChain(leftChain, points, slope, minChain);
       rightChain = this.verifyChain(rightChain, points, slope, minChain);
     }
+    if (this.cfg.traceMinLength > 0 && points && points.count && segs.length > 1) {
+      if (!leftChain.length) leftChain = this.traceLine(points, predicted - half, slope, segs);
+      if (!rightChain.length) rightChain = this.traceLine(points, predicted + half, slope, segs);
+    }
     if (this.settle > 0) this.settle--;
     // Spacing check: drop the side that disagrees with the prediction when the two lines are not a
     // lane width apart (one of them is a neighbor line, a diagonal or a shadow edge).
@@ -326,6 +340,52 @@ export class LaneTracker {
     const confidence = matched.left && matched.right ? 1 : segmentsSeen >= 2 ? 0.7 : 0.6;
     this.last = this.debounced(this.output(matched, confidence), true);
     return this.last;
+  }
+
+  // Traces one line through the ground points starting at offset y0 (at x = 0) on the lane's course;
+  // returns it resampled at the segments' distances, or [] (see traceMinLength).
+  traceLine({ pts, count }, y0, slope, segs) {
+    const { traceStep, traceWindow, traceMaxTurn, traceMisses, traceMinPoints, traceMinLength } = this.cfg;
+    const x0 = segs[0].x - traceStep;
+    const xEnd = segs[segs.length - 1].x + traceStep;
+    let y = y0 + slope * x0 + this.curve * x0 * x0;
+    let dir = slope + 2 * this.curve * x0;
+    const trace = [];
+    let misses = 0;
+    for (let x = x0; x <= xEnd; x += traceStep) {
+      const expect = y;
+      const ys = [];
+      for (let i = 0; i < count; i++) {
+        const px = pts[2 * i], py = pts[2 * i + 1];
+        if (Math.abs(px - x) <= traceStep / 2 && Math.abs(py - expect) <= traceWindow) ys.push(py);
+      }
+      if (ys.length >= traceMinPoints) {
+        ys.sort((a, b) => a - b);
+        const obs = ys[ys.length >> 1];
+        if (trace.length) {
+          const last = trace[trace.length - 1];
+          const d = (obs - last.y) / (x - last.x);
+          dir += Math.max(-traceMaxTurn, Math.min(traceMaxTurn, d - dir));
+        }
+        trace.push({ x, y: obs });
+        misses = 0;
+        y = obs + dir * traceStep;
+      } else {
+        if (trace.length && ++misses >= traceMisses) break;
+        y += dir * traceStep;
+      }
+    }
+    if (trace.length < 2 || trace[trace.length - 1].x - trace[0].x < traceMinLength) return [];
+    // Resample at the segment distances inside the traced span (same weight as peak chains).
+    const out = [];
+    for (const seg of segs) {
+      if (seg.x < trace[0].x || seg.x > trace[trace.length - 1].x) continue;
+      let k = 1;
+      while (k < trace.length - 1 && trace[k].x < seg.x) k++;
+      const a = trace[k - 1], b = trace[k];
+      out.push({ x: seg.x, y: a.y + ((b.y - a.y) * (seg.x - a.x)) / (b.x - a.x || 1) });
+    }
+    return out.length >= 2 ? out : [];
   }
 
   // Drops chain points whose local white points do not run along the lane (see verifySlope).
