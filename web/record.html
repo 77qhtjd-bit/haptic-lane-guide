@@ -1,0 +1,254 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Track Recorder</title>
+<style>
+  body { margin: 0; padding: 12px; background: #000; color: #fff; font: 20px/1.4 -apple-system, system-ui, sans-serif; }
+  button, select, input[type=text] { font-size: 22px; padding: 14px; margin: 5px 0; width: 100%; box-sizing: border-box; border-radius: 10px; border: 0; }
+  button { background: #333; color: #fff; }
+  #start { background: #0a84ff; font-size: 28px; }
+  #rec { background: #ff453a; font-size: 32px; padding: 26px; }
+  #rec.stop { background: #8e8e93; }
+  #save { background: #30d158; font-size: 28px; }
+  button:disabled { opacity: .4; }
+  label { display: block; margin-top: 6px; font-size: 18px; color: #aaa; }
+  .row { display: flex; justify-content: space-between; border-bottom: 1px solid #333; padding: 3px 0; }
+  .v { font-weight: 700; font-variant-numeric: tabular-nums; }
+  video { width: 100%; max-height: 28vh; background: #222; object-fit: contain; }
+  #hint { color: #ffd60a; font-size: 18px; }
+  #links a { display: block; color: #64d2ff; font-size: 18px; margin: 4px 0; }
+  #errors { color: #ff453a; font-size: 16px; white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<!-- Offline recorder for algorithm development: video + full-rate IMU + per-frame timestamps,
+     saved on the phone. Uses no network after the page has loaded. -->
+<button id="start">Start camera + sensors</button>
+<label>Camera <select id="cam" disabled></select></label>
+<label>Max clip length
+  <select id="maxlen">
+    <option value="1">1 min</option><option value="3">3 min</option><option value="5">5 min</option>
+    <option value="10" selected>10 min</option><option value="15">15 min</option><option value="20">20 min</option>
+  </select>
+</label>
+<label>Video bitrate (lower = smaller file, safer for long clips)
+  <select id="bitrate">
+    <option value="1000000">1 Mbps (~7.5 MB/min)</option>
+    <option value="2500000" selected>2.5 Mbps (~19 MB/min)</option>
+    <option value="4000000">4 Mbps (~30 MB/min)</option>
+  </select>
+</label>
+<label>Memo (lane, what you did)</label>
+<input type="text" id="memo" placeholder="e.g. lane 2, drift right at 20 s">
+<button id="rec" disabled>Record</button>
+<div id="hint"></div>
+<button id="save" disabled>Save to phone</button>
+<div id="links"></div>
+
+<div class="row"><span>Elapsed / max</span><span class="v" id="elapsed">-</span></div>
+<div class="row"><span>File size (est.)</span><span class="v" id="size">-</span></div>
+<div class="row"><span>IMU rate</span><span class="v" id="hz">-</span></div>
+<div class="row"><span>IMU gaps &gt;200 ms</span><span class="v" id="gaps">-</span></div>
+<div class="row"><span>Frames logged</span><span class="v" id="frames">-</span></div>
+<div class="row"><span>Camera</span><span class="v" id="settings">-</span></div>
+<div class="row"><span>Recorder format</span><span class="v" id="mime">-</span></div>
+<div class="row"><span>Save method</span><span class="v" id="method">-</span></div>
+<div class="row"><span>Wake lock</span><span class="v" id="wake">-</span></div>
+<video id="video" playsinline muted autoplay></video>
+<p style="font-size:16px;color:#888">Page version: <span id="ver"></span></p>
+<div id="errors"></div>
+
+<script>
+"use strict";
+const PAGE_VERSION = "record-1";
+const now = () => performance.timeOrigin + performance.now();   // same clock as all other pages
+const $ = (id) => document.getElementById(id);
+$("ver").textContent = PAGE_VERSION;
+function err(msg) { console.error(msg); $("errors").textContent = new Date().toLocaleTimeString() + " " + msg + "\n" + $("errors").textContent.slice(0, 600); }
+window.addEventListener("error", (e) => err("JS error: " + e.message));
+window.addEventListener("unhandledrejection", (e) => err("Promise: " + (e.reason && e.reason.message || e.reason)));
+
+const canShareFiles = !!(navigator.canShare && navigator.canShare({ files: [new File(["x"], "x.json", { type: "application/json" })] }));
+$("method").textContent = canShareFiles ? "share sheet (Save to Files)" : "download links";
+
+const video = $("video");
+let stream = null, track = null, wakeLock = null;
+let recorder = null, chunks = [], recBytes = 0, rec = null, stopTimer = null, saved = null;
+
+// ---------- IMU (always counted; stored only while recording) ----------
+let imuN = 0, lastMotionT = 0, gapCount = 0;
+function onMotion(e) {
+  const t = now();
+  if (lastMotionT && t - lastMotionT > 200) {
+    gapCount++;
+    if (rec) rec.imu_gaps.push([Math.round(t - rec.rec_start_t), Math.round(t - lastMotionT)]);
+  }
+  lastMotionT = t;
+  imuN++;
+  if (!rec) return;
+  const a = e.acceleration || {}, g = e.accelerationIncludingGravity || {}, r = e.rotationRate || {};
+  rec.samples.push({ k: "m", t, ax: a.x, ay: a.y, az: a.z, gx: g.x, gy: g.y, gz: g.z,
+                     ra: r.alpha, rb: r.beta, rg: r.gamma, iv: e.interval });
+}
+function onOrientation(e) {
+  if (rec) rec.samples.push({ k: "o", t: now(), al: e.alpha, be: e.beta, ga: e.gamma, abs: e.absolute });
+}
+
+// ---------- Per-frame timestamps while recording ----------
+function onFrame(ts, md) {
+  if (rec) rec.frames.push([+(performance.timeOrigin + (md && md.captureTime ? md.captureTime : ts)).toFixed(1),
+                            md && md.mediaTime != null ? +md.mediaTime.toFixed(4) : null]);
+  video.requestVideoFrameCallback(onFrame);
+}
+
+// ---------- Camera ----------
+async function openCamera(deviceId) {
+  if (stream) stream.getTracks().forEach((t) => t.stop());
+  const v = { width: 640, height: 480, frameRate: 30 };
+  if (deviceId) v.deviceId = { exact: deviceId }; else v.facingMode = "environment";
+  stream = await navigator.mediaDevices.getUserMedia({ video: v, audio: false });
+  track = stream.getVideoTracks()[0];
+  video.srcObject = stream;
+  await video.play().catch((e) => err("video.play: " + e.message));
+  const st = track.getSettings();
+  $("settings").textContent = `${track.label || "?"} ${st.width}x${st.height}@${st.frameRate}`;
+}
+$("cam").onchange = () => openCamera($("cam").value).catch((e) => err("camera: " + e.message));
+
+async function requestWakeLock() {
+  if (!("wakeLock" in navigator)) { $("wake").textContent = "not available"; return; }
+  try { wakeLock = await navigator.wakeLock.request("screen"); $("wake").textContent = "on"; }
+  catch (e) { $("wake").textContent = "failed (set Auto-Lock: Never)"; }
+}
+document.addEventListener("visibilitychange", () => {
+  if (rec) rec.events.push([Math.round(now() - rec.rec_start_t), "visibility:" + document.visibilityState]);
+  if (document.visibilityState === "visible" && stream) requestWakeLock();
+});
+
+$("start").onclick = async () => {
+  $("start").disabled = true;
+  // iOS: permission requests inside the tap, before other awaits.
+  const motionP = (typeof DeviceMotionEvent !== "undefined" && typeof DeviceMotionEvent.requestPermission === "function")
+    ? DeviceMotionEvent.requestPermission().catch((e) => "error: " + e.message) : Promise.resolve("granted");
+  const orientP = (typeof DeviceOrientationEvent !== "undefined" && typeof DeviceOrientationEvent.requestPermission === "function")
+    ? DeviceOrientationEvent.requestPermission().catch((e) => "error: " + e.message) : Promise.resolve("granted");
+  const camP = openCamera(null).then(() => "ok", (e) => { err("camera: " + e.name + " " + e.message); return "fail"; });
+  const [pm, , cam] = await Promise.all([motionP, orientP, camP]);
+  if (pm !== "granted") err("motion permission: " + pm);
+  window.addEventListener("devicemotion", onMotion);
+  window.addEventListener("deviceorientation", onOrientation);
+  requestWakeLock();
+  if (cam !== "ok") { $("start").disabled = false; return; }
+  if ("requestVideoFrameCallback" in HTMLVideoElement.prototype) video.requestVideoFrameCallback(onFrame);
+  else err("requestVideoFrameCallback missing: per-frame timestamps will not be logged");
+  const devs = (await navigator.mediaDevices.enumerateDevices()).filter((d) => d.kind === "videoinput");
+  const cur = track.getSettings().deviceId;
+  $("cam").innerHTML = devs.map((d, i) => `<option value="${d.deviceId}" ${d.deviceId === cur ? "selected" : ""}>${d.label || "camera " + i}</option>`).join("");
+  $("cam").disabled = false;
+  $("rec").disabled = typeof MediaRecorder === "undefined";
+  if ($("rec").disabled) err("MediaRecorder missing");
+  $("start").textContent = "Camera ready";
+};
+
+// ---------- Recording ----------
+function pickMime() {
+  return ["video/mp4;codecs=avc1", "video/mp4", "video/webm;codecs=vp8", "video/webm"]
+    .find((m) => MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported(m)) || "";
+}
+const stamp = () => {
+  const d = new Date(), p = (x) => String(x).padStart(2, "0");
+  return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
+};
+
+$("rec").onclick = () => (recorder ? stopRecording("manual") : startRecording());
+
+function startRecording() {
+  if (saved && !saved.done && !confirm("The previous clip has not been saved. Discard it?")) return;
+  saved = null;
+  $("save").disabled = true;
+  $("links").innerHTML = "";
+  const mimeType = pickMime(), bitrate = +$("bitrate").value;
+  try { recorder = new MediaRecorder(stream, mimeType ? { mimeType, videoBitsPerSecond: bitrate } : { videoBitsPerSecond: bitrate }); }
+  catch (e) { err("MediaRecorder: " + e.message); recorder = null; return; }
+  chunks = []; recBytes = 0;
+  const t0 = now();
+  rec = { page_version: PAGE_VERSION, name: "rec_" + stamp(), userAgent: navigator.userAgent, memo: $("memo").value,
+          mimeType: recorder.mimeType || mimeType, bitrate, max_minutes: +$("maxlen").value,
+          trackLabel: track.label, trackSettings: track.getSettings(),
+          rec_start_call_t: t0, rec_start_event_t: null, rec_start_t: t0, rec_stop_t: null, stop_reason: null,
+          clock: "performance.timeOrigin + performance.now() (ms)",
+          samples: [], frames: [], imu_gaps: [], events: [] };
+  recorder.onstart = () => { rec.rec_start_event_t = now(); rec.rec_start_t = rec.rec_start_event_t; };
+  recorder.ondataavailable = (e) => { if (e.data && e.data.size) { chunks.push(e.data); recBytes += e.data.size; } };
+  recorder.onerror = (e) => err("MediaRecorder error: " + (e.error && e.error.message));
+  recorder.onstop = finishRecording;
+  recorder.start(1000);
+  stopTimer = setTimeout(() => stopRecording("max length"), rec.max_minutes * 60000);
+  $("rec").textContent = "Stop";
+  $("rec").className = "stop";
+  for (const id of ["cam", "maxlen", "bitrate", "memo"]) $(id).disabled = true;
+  $("hint").textContent = "Tap the phone sharply once now (sync marker), then mount it.";
+  setTimeout(() => { if (recorder) $("hint").textContent = ""; }, 6000);
+}
+
+function stopRecording(reason) {
+  if (!recorder) return;
+  clearTimeout(stopTimer);
+  rec.rec_stop_t = now();
+  rec.stop_reason = reason;
+  recorder.stop();
+  $("rec").disabled = true;
+}
+
+function finishRecording() {
+  const type = rec.mimeType || "video/mp4";
+  const ext = type.includes("webm") ? "webm" : "mp4";
+  rec.memo = $("memo").value;
+  const videoFile = new File(chunks, `${rec.name}.${ext}`, { type });
+  const jsonFile = new File([JSON.stringify(rec)], `${rec.name}.json`, { type: "application/json" });
+  saved = { files: [videoFile, jsonFile], done: false };
+  const info = `${rec.name}: ${(videoFile.size / 1e6).toFixed(1)} MB video, ${rec.samples.length} IMU samples, ${rec.frames.length} frames`;
+  $("hint").textContent = `Stopped (${rec.stop_reason}). ${info}. Tap "Save to phone".`;
+  // Fallback links always shown (also useful if the share sheet is cancelled).
+  $("links").innerHTML = saved.files.map((f) => `<a href="${URL.createObjectURL(f)}" download="${f.name}">Download ${f.name}</a>`).join("");
+  recorder = null; rec = null; chunks = [];
+  $("save").disabled = false;
+  $("rec").disabled = false;
+  $("rec").textContent = "Record";
+  $("rec").className = "";
+  for (const id of ["cam", "maxlen", "bitrate", "memo"]) $(id).disabled = false;
+}
+
+// Share sheet needs a tap of its own (user gesture), so saving is a separate button.
+$("save").onclick = async () => {
+  if (!saved) return;
+  if (!canShareFiles) { $("hint").textContent = "Use the download links below (save both files)."; return; }
+  try {
+    await navigator.share({ files: saved.files, title: saved.files[0].name });
+    saved.done = true;
+    $("hint").textContent = "Saved. Keep both files (.mp4 and .json) together.";
+  } catch (e) {
+    if (e.name !== "AbortError") err("share: " + e.name + " " + e.message);
+    $("hint").textContent = "Not saved yet. Tap Save again, or use the download links.";
+  }
+};
+
+// ---------- Status ----------
+setInterval(() => {
+  $("hz").textContent = imuN + " Hz";
+  imuN = 0;
+  $("gaps").textContent = String(gapCount);
+  if (recorder && rec) {
+    const s = (now() - rec.rec_start_t) / 1000;
+    $("elapsed").textContent = `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, "0")} / ${rec.max_minutes}:00`;
+    $("size").textContent = (recBytes / 1e6).toFixed(1) + " MB";
+    $("frames").textContent = String(rec.frames.length);
+    $("mime").textContent = rec.mimeType;
+  }
+}, 1000);
+window.addEventListener("beforeunload", (e) => { if (recorder || (saved && !saved.done)) { e.preventDefault(); e.returnValue = ""; } });
+</script>
+</body>
+</html>

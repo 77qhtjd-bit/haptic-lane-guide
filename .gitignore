@@ -10,3 +10,8 @@ xcuserdata/
 # Python (log analysis)
 __pycache__/
 .venv/
+# Recorded sessions (videos of people at the venue, hundreds of MB) - never commit
+data/
+# Arduino Wi-Fi credentials
+arduino_secrets.h
+*.zip

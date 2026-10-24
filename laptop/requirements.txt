@@ -1,0 +1,5 @@
+fastapi>=0.110
+uvicorn[standard]>=0.29
+numpy>=1.26
+matplotlib>=3.8
+opencv-python-headless>=4.9

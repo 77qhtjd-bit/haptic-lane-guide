@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Stream Viewer</title>
+<style>
+  body { margin: 0; padding: 16px; background: #111; color: #eee; font: 16px/1.4 system-ui, sans-serif; }
+  img { max-width: 100%; max-height: 70vh; background: #222; display: block; }
+  pre { font-size: 15px; }
+</style>
+</head>
+<body>
+<img id="frame" alt="latest frame">
+<pre id="info">waiting for data...</pre>
+<script>
+"use strict";
+setInterval(async () => {
+  try {
+    const d = await (await fetch("/api/latest", { cache: "no-store" })).json();
+    if (d.frame_t) document.getElementById("frame").src = "/latest.jpg?t=" + d.frame_t;
+    const age = d.frame_t ? ((Date.now() - d.frame_t) / 1000).toFixed(2) + " s (includes clock offset)" : "-";
+    document.getElementById("info").textContent =
+      `session: ${d.session}\nframe t: ${d.frame_t}  age: ${age}\n\n` +
+      `motion:\n${JSON.stringify(d.motion, null, 1)}\n\norientation:\n${JSON.stringify(d.orientation, null, 1)}`;
+  } catch (e) {
+    document.getElementById("info").textContent = "error: " + e.message;
+  }
+}, 200);
+</script>
+</body>
+</html>

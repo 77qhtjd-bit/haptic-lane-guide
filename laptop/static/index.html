@@ -1,0 +1,537 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>iPhone Sensor Stream</title>
+<style>
+  body { margin: 0; padding: 12px; background: #000; color: #fff; font: 20px/1.35 -apple-system, system-ui, sans-serif; }
+  button, select { font-size: 24px; padding: 14px; margin: 6px 0; width: 100%; border-radius: 10px; border: 0; }
+  #start { background: #0a84ff; color: #fff; font-size: 34px; padding: 28px; }
+  #rec { background: #ff453a; color: #fff; }
+  button:disabled { opacity: .4; }
+  video { width: 100%; max-height: 30vh; background: #222; object-fit: contain; }
+  .row { display: flex; justify-content: space-between; border-bottom: 1px solid #333; padding: 4px 0; }
+  .v { font-weight: 700; font-variant-numeric: tabular-nums; }
+  .ok { color: #30d158; } .bad { color: #ff453a; }
+  #errors { color: #ff453a; font-size: 16px; white-space: pre-wrap; }
+  #apis span { display: inline-block; margin-right: 12px; }
+  label { display: block; margin-top: 8px; }
+</style>
+</head>
+<body>
+<button id="start">Start</button>
+<div id="apis"></div>
+
+<label>Camera <select id="cam" disabled></select></label>
+<label>Live frame rate
+  <select id="fps">
+    <option value="0">off</option>
+    <option value="5">5 fps</option>
+    <option value="10" selected>10 fps</option>
+    <option value="15">15 fps</option>
+  </select>
+</label>
+<button id="rec" disabled>Record</button>
+<button id="bleconn">Connect Arduino (BLE)</button>
+<label>Decision (placeholder)
+  <select id="decidemode">
+    <option value="off">off (relay laptop /control commands)</option>
+    <option value="phone">on phone</option>
+    <option value="laptop">on laptop</option>
+  </select>
+</label>
+
+<div class="row"><span>Permissions</span><span class="v" id="perm">-</span></div>
+<div class="row"><span>WebSocket</span><span class="v" id="wsstate">-</span></div>
+<div class="row"><span>Session</span><span class="v" id="sess">-</span></div>
+<div class="row"><span>IMU (motion)</span><span class="v" id="imuhz">-</span></div>
+<div class="row"><span>Orientation</span><span class="v" id="orihz">-</span></div>
+<div class="row"><span>IMU gaps >200ms (on phone)</span><span class="v" id="imugaps">-</span></div>
+<div class="row"><span>Frames sent</span><span class="v" id="fpsout">-</span></div>
+<div class="row"><span>Upload rate</span><span class="v" id="kbps">-</span></div>
+<div class="row"><span>RTT</span><span class="v" id="rtt">-</span></div>
+<div class="row"><span>Camera</span><span class="v" id="settings">-</span></div>
+<div class="row"><span>Record</span><span class="v" id="recstate">-</span></div>
+<div class="row"><span>BLE</span><span class="v" id="blestate">-</span></div>
+<div class="row"><span>Phone grab+decide med/p95</span><span class="v" id="decideproc">-</span></div>
+<div class="row"><span>Commands / BLE writes</span><span class="v" id="blerate">-</span></div>
+<div class="row"><span>Frame → board med/p95</span><span class="v" id="blee2e">-</span></div>
+<div class="row"><span>BLE RTT med/p95</span><span class="v" id="blertt">-</span></div>
+<div class="row"><span>BLE acks/lost/skipped</span><span class="v" id="bleacks">-</span></div>
+<button id="bleupload">Upload BLE log</button>
+<video id="video" playsinline muted autoplay></video>
+<div id="errors"></div>
+
+<script>
+"use strict";
+// Single clock for everything (ms, float).
+const now = () => performance.timeOrigin + performance.now();
+const $ = (id) => document.getElementById(id);
+
+const errors = [];
+function err(msg) {
+  console.error(msg);
+  errors.unshift(new Date().toLocaleTimeString() + " " + msg);
+  errors.length = Math.min(errors.length, 8);
+  $("errors").textContent = errors.join("\n");
+}
+window.addEventListener("error", (e) => err("JS error: " + e.message));
+window.addEventListener("unhandledrejection", (e) => err("Promise: " + (e.reason && e.reason.message || e.reason)));
+
+// ---------- API availability ----------
+const apis = {
+  getUserMedia: !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia),
+  DeviceMotionEvent: typeof DeviceMotionEvent !== "undefined",
+  DeviceOrientationEvent: typeof DeviceOrientationEvent !== "undefined",
+  motionRequestPermission: typeof DeviceMotionEvent !== "undefined" && typeof DeviceMotionEvent.requestPermission === "function",
+  wakeLock: "wakeLock" in navigator,
+  requestVideoFrameCallback: "requestVideoFrameCallback" in HTMLVideoElement.prototype,
+  MediaRecorder: typeof MediaRecorder !== "undefined",
+  bluetooth: "bluetooth" in navigator,
+  WebSocket: typeof WebSocket !== "undefined",
+  secureContext: window.isSecureContext,
+};
+$("apis").innerHTML = Object.entries(apis)
+  .map(([k, v]) => `<span class="${v ? "ok" : "bad"}">${v ? "✓" : "✗"} ${k}</span>`).join("");
+
+// ---------- State ----------
+const video = $("video");
+let stream = null, track = null, ws = null, sessionId = "", started = false;
+let wakeLock = null;
+const imuBatch = [];                  // samples waiting to be sent over WS
+let recSamples = null;                // full-rate IMU log while recording (null = not recording)
+const cnt = { motion: 0, orientation: 0, frames: 0, bytes: 0, dropped: 0 };
+let lastRtt = null, pingId = 0;
+const perm = {};
+
+function showPerm() {
+  $("perm").textContent = Object.entries(perm).map(([k, v]) => `${k}:${v}`).join(" ");
+}
+
+// ---------- WebSocket ----------
+function connectWs() {
+  const url = (location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws";
+  ws = new WebSocket(url);
+  ws.binaryType = "arraybuffer";
+  $("wsstate").textContent = "connecting";
+  ws.onopen = () => {
+    $("wsstate").textContent = "open";
+    $("wsstate").className = "v ok";
+    ws.send(JSON.stringify({ type: "hello", meta: clientMeta() }));
+  };
+  ws.onclose = (e) => {
+    $("wsstate").textContent = "closed (" + e.code + ")";
+    $("wsstate").className = "v bad";
+    if (started) setTimeout(connectWs, 2000);
+  };
+  ws.onerror = () => err("WebSocket error");
+  ws.onmessage = (e) => {
+    const m = JSON.parse(e.data);
+    if (m.type === "session") { sessionId = m.id; $("sess").textContent = m.id; }
+    else if (m.type === "pong") { lastRtt = now() - m.t; $("rtt").textContent = lastRtt.toFixed(0) + " ms"; }
+    else if (m.type === "cmd") bleRelay(m);
+  };
+}
+const wsOpen = () => ws && ws.readyState === WebSocket.OPEN;
+function sendJson(obj) {
+  if (!wsOpen()) return false;
+  const s = JSON.stringify(obj);
+  ws.send(s);
+  cnt.bytes += s.length;
+  return true;
+}
+
+function clientMeta() {
+  return {
+    t: now(),
+    userAgent: navigator.userAgent,
+    apis,
+    permissions: perm,
+    trackSettings: track ? track.getSettings() : null,
+    trackLabel: track ? track.label : null,
+    videoInputs: videoInputs.map((d) => ({ deviceId: d.deviceId, label: d.label })),
+    screen: { w: screen.width, h: screen.height, dpr: devicePixelRatio },
+    frameTimestampSource: apis.requestVideoFrameCallback ? "rVFC captureTime if present, else rVFC now" : "rAF now",
+  };
+}
+
+// ---------- IMU ----------
+function onMotion(e) {
+  const a = e.acceleration || {}, g = e.accelerationIncludingGravity || {}, r = e.rotationRate || {};
+  const s = { k: "m", t: now(), ax: a.x, ay: a.y, az: a.z, gx: g.x, gy: g.y, gz: g.z,
+              ra: r.alpha, rb: r.beta, rg: r.gamma, iv: e.interval };
+  cnt.motion++;
+  imuBatch.push(s);
+  if (recSamples) recSamples.push(s);
+}
+function onOrientation(e) {
+  const s = { k: "o", t: now(), al: e.alpha, be: e.beta, ga: e.gamma, abs: e.absolute };
+  cnt.orientation++;
+  imuBatch.push(s);
+  if (recSamples) recSamples.push(s);
+}
+setInterval(() => {
+  if (imuBatch.length === 0) return;
+  sendJson({ type: "imu", samples: imuBatch });   // dropped if WS is not open
+  imuBatch.length = 0;
+}, 100);
+
+// ---------- Wake lock ----------
+async function requestWakeLock() {
+  if (!apis.wakeLock) return;
+  try {
+    wakeLock = await navigator.wakeLock.request("screen");
+    perm.wakeLock = "on";
+  } catch (e) { perm.wakeLock = "fail"; err("wakeLock: " + e.message); }
+  showPerm();
+}
+document.addEventListener("visibilitychange", () => {
+  if (started && document.visibilityState === "visible") requestWakeLock();
+});
+
+// ---------- Camera ----------
+let videoInputs = [];
+async function openCamera(deviceId) {
+  if (stream) stream.getTracks().forEach((t) => t.stop());
+  const v = { width: 640, height: 480, frameRate: 30 };
+  if (deviceId) v.deviceId = { exact: deviceId }; else v.facingMode = "environment";
+  stream = await navigator.mediaDevices.getUserMedia({ video: v, audio: false });
+  track = stream.getVideoTracks()[0];
+  video.srcObject = stream;
+  await video.play().catch((e) => err("video.play: " + e.message));
+  const st = track.getSettings();
+  $("settings").textContent = `${st.width}x${st.height} @${st.frameRate}fps`;
+  sendJson({ type: "meta", meta: { event: "camera", trackLabel: track.label, trackSettings: st } });
+}
+async function listCameras() {
+  const devs = await navigator.mediaDevices.enumerateDevices();
+  videoInputs = devs.filter((d) => d.kind === "videoinput");
+  const cur = track && track.getSettings().deviceId;
+  $("cam").innerHTML = videoInputs
+    .map((d, i) => `<option value="${d.deviceId}" ${d.deviceId === cur ? "selected" : ""}>${d.label || "camera " + i}</option>`)
+    .join("");
+  $("cam").disabled = false;
+  sendJson({ type: "meta", meta: { event: "devices", videoInputs: videoInputs.map((d) => ({ deviceId: d.deviceId, label: d.label })) } });
+}
+$("cam").onchange = () => openCamera($("cam").value).catch((e) => err("camera switch: " + e.name + " " + e.message));
+
+// ---------- Live frames ----------
+const canvas = document.createElement("canvas");
+const ctx = canvas.getContext("2d");
+let lastSent = 0, encoding = false;
+
+function onFrame(frameNow, md) {
+  scheduleFrame();
+  const fps = +$("fps").value;
+  if (!fps || !wsOpen() || !video.videoWidth) return;
+  const t = performance.timeOrigin + (md && md.captureTime ? md.captureTime : frameNow);
+  if (t - lastSent < 1000 / fps - 5) return;
+  // Skip if previous encode is still running or the socket is backed up.
+  if (encoding || ws.bufferedAmount > 1e6) { cnt.dropped++; return; }
+  lastSent = t;
+  const scale = Math.min(1, 640 / Math.max(video.videoWidth, video.videoHeight));
+  canvas.width = Math.round(video.videoWidth * scale);
+  canvas.height = Math.round(video.videoHeight * scale);
+  ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+  encoding = true;
+  canvas.toBlob(async (blob) => {
+    try {
+      if (!blob) { err("toBlob returned null"); return; }
+      const jpg = await blob.arrayBuffer();
+      const buf = new ArrayBuffer(8 + jpg.byteLength);
+      new DataView(buf).setFloat64(0, t, true);   // little-endian timestamp header
+      new Uint8Array(buf, 8).set(new Uint8Array(jpg));
+      if (wsOpen()) { ws.send(buf); cnt.frames++; cnt.bytes += buf.byteLength; }
+    } finally { encoding = false; }
+  }, "image/jpeg", 0.6);
+}
+function scheduleFrame() {
+  if (apis.requestVideoFrameCallback) video.requestVideoFrameCallback(onFrame);
+  else requestAnimationFrame((ts) => onFrame(ts, null));
+}
+
+// ---------- Latency probe + status ----------
+setInterval(() => {
+  if (started) sendJson({ type: "ping", id: ++pingId, t: now(), last_rtt: lastRtt });
+  $("imuhz").textContent = cnt.motion + " Hz";
+  $("orihz").textContent = cnt.orientation + " Hz";
+  $("fpsout").textContent = cnt.frames + " /s" + (cnt.dropped ? ` (skipped ${cnt.dropped})` : "");
+  $("kbps").textContent = (cnt.bytes / 1024).toFixed(0) + " kB/s";
+  for (const k in cnt) cnt[k] = 0;
+}, 1000);
+
+// ---------- Start ----------
+$("start").onclick = async () => {
+  if (started) return;
+  $("start").disabled = true;
+  // iOS: permission requests must happen inside the user gesture, before any other await.
+  const motionP = apis.motionRequestPermission ? DeviceMotionEvent.requestPermission().catch((e) => "error: " + e.message) : Promise.resolve("n/a");
+  const orientP = (typeof DeviceOrientationEvent !== "undefined" && typeof DeviceOrientationEvent.requestPermission === "function")
+    ? DeviceOrientationEvent.requestPermission().catch((e) => "error: " + e.message) : Promise.resolve("n/a");
+  const camP = apis.getUserMedia ? openCamera(null).then(() => "granted", (e) => { err("getUserMedia: " + e.name + " " + e.message); return "denied"; })
+                                 : Promise.resolve("missing");
+  [perm.motion, perm.orientation, perm.camera] = await Promise.all([motionP, orientP, camP]);
+  showPerm();
+
+  started = true;
+  $("start").textContent = "Running";
+  if (apis.DeviceMotionEvent) window.addEventListener("devicemotion", onMotion);
+  if (apis.DeviceOrientationEvent) window.addEventListener("deviceorientation", onOrientation);
+  connectWs();
+  requestWakeLock();
+  if (perm.camera === "granted") {
+    await listCameras().catch((e) => err("enumerateDevices: " + e.message));
+    scheduleFrame();
+    $("rec").disabled = !apis.MediaRecorder;
+  }
+  if (!apis.DeviceMotionEvent) err("DeviceMotionEvent missing");
+};
+
+// ---------- Record mode ----------
+let recorder = null, recChunks = [], recInfo = null;
+function pickMime() {
+  const c = ["video/mp4;codecs=avc1", "video/mp4", "video/webm;codecs=vp8", "video/webm"];
+  return c.find((m) => MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported(m)) || "";
+}
+$("rec").onclick = () => (recorder ? stopRecording() : startRecording());
+
+function startRecording() {
+  const mimeType = pickMime();
+  try {
+    recorder = new MediaRecorder(stream, mimeType ? { mimeType, videoBitsPerSecond: 2500000 } : {});
+  } catch (e) { err("MediaRecorder: " + e.message); recorder = null; return; }
+  recChunks = [];
+  recSamples = [];
+  recInfo = { mimeType: recorder.mimeType || mimeType, start_call_t: now(), start_event_t: null, stop_t: null,
+              trackSettings: track.getSettings(), trackLabel: track.label };
+  recorder.onstart = () => { recInfo.start_event_t = now(); };
+  recorder.ondataavailable = (e) => { if (e.data && e.data.size) recChunks.push(e.data); };
+  recorder.onerror = (e) => err("MediaRecorder error: " + (e.error && e.error.message));
+  recorder.onstop = uploadRecording;
+  recorder.start(1000);
+  $("cam").disabled = true;
+  $("rec").textContent = "Stop recording";
+  const t0 = recInfo.start_call_t;
+  recInfo.timer = setInterval(() => { $("recstate").textContent = "REC " + ((now() - t0) / 1000).toFixed(0) + " s"; }, 500);
+}
+function stopRecording() {
+  recInfo.stop_t = now();
+  clearInterval(recInfo.timer);
+  delete recInfo.timer;
+  recorder.stop();
+  $("rec").disabled = true;
+}
+async function uploadRecording() {
+  const samples = recSamples;
+  recSamples = null;
+  recorder = null;
+  const type = recInfo.mimeType || "video/mp4";
+  const ext = type.includes("webm") ? "webm" : "mp4";
+  const blob = new Blob(recChunks, { type });
+  // Video timestamps are relative to recording start; start_event_t (if fired) is the sync reference.
+  recInfo.rec_start_t = recInfo.start_event_t || recInfo.start_call_t;
+  const tag = String(Math.round(recInfo.rec_start_t));
+  try {
+    $("recstate").textContent = `uploading IMU (${samples.length})`;
+    let r = await fetch(`/upload?kind=imu&tag=${tag}&session=${encodeURIComponent(sessionId)}`,
+      { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ...recInfo, ext, samples }) });
+    if (!r.ok) throw new Error("IMU upload HTTP " + r.status);
+    const sess = (await r.json()).session;
+    $("recstate").textContent = `uploading video ${(blob.size / 1e6).toFixed(1)} MB`;
+    r = await fetch(`/upload?kind=video&tag=${tag}&ext=${ext}&session=${encodeURIComponent(sess)}`,
+      { method: "POST", headers: { "Content-Type": type }, body: blob });
+    if (!r.ok) throw new Error("video upload HTTP " + r.status);
+    $("recstate").textContent = `uploaded ${(blob.size / 1e6).toFixed(1)} MB, ${samples.length} IMU`;
+  } catch (e) {
+    err("upload: " + e.message);
+    $("recstate").textContent = "upload FAILED";
+  }
+  $("rec").textContent = "Record";
+  $("rec").disabled = false;
+  $("cam").disabled = false;
+}
+
+// ---------- BLE to Arduino (Bluefy only) ----------
+// Commands come either from the laptop (WebSocket "cmd", one per frame) or from the on-phone
+// placeholder decide(). Every BLE write is logged with phone-clock timestamps for latency analysis.
+const BLE_SERVICE = "06096ed2-b23b-4ba5-9737-27dba2053749";
+const BLE_CMD = "14dd8746-dd9e-4308-8f98-08701035fc46";
+const BLE_ACK = "535f34b1-32f0-4532-97d1-18f2fff4bfbe";
+let bleCmd = null, bleWriting = false, bleNoResp = false, phoneSeq = 0;
+const blePending = new Map(), bleLog = [], bleRtts = [], bleE2e = [], procMs = [];
+const bleCnt = { cmds: 0, writes: 0, acks: 0, lost: 0, skipped: 0 };
+if (!apis.bluetooth) $("bleconn").disabled = true;
+
+$("bleconn").onclick = async () => {
+  try {
+    const dev = await navigator.bluetooth.requestDevice({ filters: [{ services: [BLE_SERVICE] }] });
+    dev.addEventListener("gattserverdisconnected", () => { bleCmd = null; $("blestate").textContent = "disconnected"; $("blestate").className = "v bad"; });
+    $("blestate").textContent = "connecting";
+    const svc = await (await dev.gatt.connect()).getPrimaryService(BLE_SERVICE);
+    bleCmd = await svc.getCharacteristic(BLE_CMD);
+    const ack = await svc.getCharacteristic(BLE_ACK);
+    ack.addEventListener("characteristicvaluechanged", onBleAck);
+    await ack.startNotifications();
+    bleNoResp = typeof bleCmd.writeValueWithoutResponse === "function";
+    $("blestate").textContent = "connected" + (bleNoResp ? "" : " (with response)");
+    $("blestate").className = "v ok";
+  } catch (e) { err("BLE: " + e.name + " " + e.message); $("blestate").textContent = "failed"; $("blestate").className = "v bad"; }
+};
+
+// row: { seq, left, right, frame_t, cmd_ready_t, ... }. Writes immediately or skips if busy.
+async function bleSend(row) {
+  bleCnt.cmds++;
+  if (!bleCmd) return;
+  if (bleWriting) { bleCnt.skipped++; return; }   // previous GATT write still in progress
+  bleWriting = true;
+  try {
+    row.ble_write_t = now();
+    row.ack_t = row.rtt_ms = "";
+    row.live_fps = +$("fps").value;   // streaming load at the time (0 = off)
+    blePending.set(row.seq, row);
+    bleLog.push(row);
+    const buf = new Uint8Array([row.seq & 0xff, row.seq >> 8, row.left, row.right]);
+    if (bleNoResp) await bleCmd.writeValueWithoutResponse(buf); else await bleCmd.writeValue(buf);
+    bleCnt.writes++;
+  } catch (e) { err("BLE write: " + e.message); }
+  finally { bleWriting = false; }
+}
+
+function onBleAck(e) {
+  const t = now();
+  const row = blePending.get(e.target.value.getUint16(0, true));
+  if (!row) return;
+  blePending.delete(row.seq);
+  row.ack_t = t;
+  row.rtt_ms = t - row.ble_write_t;
+  bleRtts.push(row.rtt_ms);
+  bleE2e.push(row.ble_write_t + row.rtt_ms / 2 - row.frame_t);   // frame capture -> board (estimate)
+  if (bleRtts.length > 200) { bleRtts.shift(); bleE2e.shift(); }
+  bleCnt.acks++;
+}
+
+// Laptop path: one "cmd" per streamed frame. Ignored while the phone decides itself.
+function bleRelay(m) {
+  if ($("decidemode").value === "phone") return;
+  bleSend({ mode: "laptop-" + m.mode, seq: m.seq, left: m.left, right: m.right, proc_ms: m.proc_ms ?? "", frame_t: m.frame_t, imu_t: m.imu_t ?? "", srv_recv_t: m.srv_recv_t,
+            srv_send_t: m.srv_send_t, offset: m.offset ?? "", cmd_ready_t: now() });
+}
+
+$("decidemode").onchange = async () => {
+  const v = $("decidemode").value;
+  // Laptop decides (placeholder decide() per frame) only in "laptop"; otherwise reset it to manual 0/0.
+  const body = v === "laptop" ? { mode: "frame" } : { mode: "manual", left: 0, right: 0 };
+  try { await fetch("/api/actuator", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }); }
+  catch (e) { err("set laptop mode: " + e.message); }
+};
+
+// ---------- On-phone decision (placeholder, no image analysis yet) ----------
+// Grabs the frame pixels (what an algorithm would get) and the latest IMU sample, calls decide(),
+// and writes the result over BLE at up to DECIDE_HZ.
+const DECIDE_HZ = 20;
+const grabCanvas = document.createElement("canvas");
+const grabCtx = grabCanvas.getContext("2d", { willReadFrequently: true });
+let lastDecideT = 0, latestMotion = null;
+// On-phone IMU gap statistics (independent of the network): counted since the first sample.
+const imuGap = { first: 0, count: 0, max: 0 };
+window.addEventListener("devicemotion", (e) => {   // read-only copy of the newest sample
+  const g = e.accelerationIncludingGravity || {}, r = e.rotationRate || {};
+  const t = now();
+  if (latestMotion) {
+    const dt = t - latestMotion.t;
+    if (dt > 200) imuGap.count++;
+    imuGap.max = Math.max(imuGap.max, dt);
+  } else imuGap.first = t;
+  latestMotion = { t, gx: g.x, gy: g.y, gz: g.z, ra: r.alpha, rb: r.beta, rg: r.gamma };
+});
+setInterval(() => {
+  if (!imuGap.first) return;
+  const min = (now() - imuGap.first) / 60000;
+  $("imugaps").textContent = `${imuGap.count} in ${min.toFixed(1)} min, max ${imuGap.max.toFixed(0)} ms`;
+}, 1000);
+
+// PLACEHOLDER for the decision algorithm (phone side). Same as decide() in actuator.py.
+// pixels: RGBA bytes (w x h); imu: latest devicemotion sample or null. Returns [left, right] 0..255.
+function decide(pixels, w, h, imu) {
+  return Math.floor(Date.now() / 1000) % 2 === 0 ? [150, 0] : [0, 150];
+}
+
+// src: "rvfc" (video frame callback, frame timestamp) or "timer" (fallback when no frame callback
+// has fired for 300 ms, e.g. video scrolled off-screen; timestamp = grab time, less accurate).
+function decideFrame(frameNow, md, src) {
+  lastDecideCall = now();
+  if ($("decidemode").value !== "phone" || !video.videoWidth) return;
+  const t = src === "timer" ? now() : performance.timeOrigin + (md && md.captureTime ? md.captureTime : frameNow);
+  if (t - lastDecideT < 1000 / DECIDE_HZ - 5) return;
+  lastDecideT = t;
+  const p0 = now();
+  const w = video.videoWidth, h = video.videoHeight;   // full stream resolution
+  grabCanvas.width = w; grabCanvas.height = h;
+  grabCtx.drawImage(video, 0, 0, w, h);
+  const imu = latestMotion;
+  const [left, right] = decide(grabCtx.getImageData(0, 0, w, h).data, w, h, imu);
+  const p1 = now();
+  phoneSeq = (phoneSeq + 1) & 0xffff;
+  bleSend({ mode: "phone", seq: phoneSeq, left, right, proc_ms: p1 - p0, frame_t: t, ts_src: src,
+            imu_t: imu ? imu.t : "", cmd_ready_t: p1 });
+  procMs.push(p1 - p0);
+  if (procMs.length > 200) procMs.shift();
+  decideCnt[src]++;
+}
+let lastDecideCall = 0, lastRvfc = 0, decidePending = false;
+const decideCnt = { rvfc: 0, timer: 0 };
+function scheduleDecide() {
+  if (decidePending) return;
+  decidePending = true;
+  const cb = (ts, md) => {
+    decidePending = false;
+    lastRvfc = now();
+    try { decideFrame(ts, md, "rvfc"); }
+    catch (e) { err("decide: " + e.message); }
+    scheduleDecide();
+  };
+  if (apis.requestVideoFrameCallback) video.requestVideoFrameCallback(cb);
+  else requestAnimationFrame((ts) => cb(ts, null));
+}
+// Watchdog: re-arm the frame callback chain if it stalled, and fall back to a timer meanwhile.
+setInterval(() => {
+  if ($("decidemode").value !== "phone" || !video.videoWidth) return;
+  if (now() - lastRvfc > 300) {
+    decidePending = false;
+    scheduleDecide();
+    try { decideFrame(0, null, "timer"); }
+    catch (e) { err("decide: " + e.message); }
+  }
+}, 1000 / DECIDE_HZ);
+video.addEventListener("playing", scheduleDecide);
+
+const medP95 = (a) => {
+  if (!a.length) return "-";
+  const r = [...a].sort((x, y) => x - y);
+  return `${r[r.length >> 1].toFixed(0)} / ${r[Math.min(r.length - 1, Math.floor(r.length * 0.95))].toFixed(0)} ms`;
+};
+setInterval(() => {
+  const cutoff = now() - 1000;
+  for (const [s, row] of blePending) if (row.ble_write_t < cutoff) { blePending.delete(s); bleCnt.lost++; }
+  $("blerate").textContent = `${bleCnt.cmds} / ${bleCnt.writes} per s`;
+  $("blee2e").textContent = medP95(bleE2e);
+  $("blertt").textContent = medP95(bleRtts);
+  $("decideproc").textContent = medP95(procMs) + ` (${decideCnt.rvfc} frame + ${decideCnt.timer} timer /s)`;
+  decideCnt.rvfc = decideCnt.timer = 0;
+  $("bleacks").textContent = `${bleCnt.acks} / ${bleCnt.lost} / ${bleCnt.skipped}`;
+  bleCnt.cmds = bleCnt.writes = 0;
+}, 1000);
+
+$("bleupload").onclick = async () => {
+  try {
+    const r = await fetch("/api/ble_log", { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ userAgent: navigator.userAgent, session: sessionId, liveFps: +$("fps").value,
+                             method: bleNoResp ? "without_response" : "with_response", rows: bleLog }) });
+    $("bleupload").textContent = r.ok ? `Uploaded ${bleLog.length} rows` : "Upload failed";
+  } catch (e) { err("BLE upload: " + e.message); }
+};
+</script>
+
+</body>
+</html>

@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Import Recordings</title>
+<style>
+  body { margin: 0; padding: 16px; background: #111; color: #eee; font: 18px/1.45 system-ui, sans-serif; max-width: 760px; }
+  input, button { font-size: 20px; padding: 12px; margin: 6px 0; width: 100%; box-sizing: border-box; }
+  button { background: #0a84ff; color: #fff; border: 0; border-radius: 8px; }
+  .f { border-bottom: 1px solid #333; padding: 6px 0; font-variant-numeric: tabular-nums; }
+  .ok { color: #30d158; } .bad { color: #ff453a; }
+  code { color: #ffd60a; }
+</style>
+</head>
+<body>
+<p>Select the <b>.mp4 and .json</b> files saved by <code>/record</code> (both files of each clip).</p>
+<input type="file" id="files" multiple accept=".mp4,.webm,.json,video/*,application/json">
+<button id="go">Upload to laptop</button>
+<div id="list"></div>
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+function upload(file, el) {
+  return new Promise((resolve) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", "/api/import?name=" + encodeURIComponent(file.name));
+    xhr.upload.onprogress = (e) => { if (e.lengthComputable) el.textContent = `${file.name}: ${(100 * e.loaded / e.total).toFixed(0)}%`; };
+    xhr.onload = () => {
+      let d = {};
+      try { d = JSON.parse(xhr.responseText); } catch (_) {}
+      el.className = "f " + (xhr.status === 200 ? "ok" : "bad");
+      el.textContent = `${file.name}: ` + (xhr.status === 200 ? (d.message || "ok") : (d.error || "HTTP " + xhr.status));
+      resolve();
+    };
+    xhr.onerror = () => { el.className = "f bad"; el.textContent = `${file.name}: network error`; resolve(); };
+    xhr.send(file);
+  });
+}
+$("go").onclick = async () => {
+  const files = [...$("files").files].sort((a, b) => a.name.localeCompare(b.name));
+  $("list").innerHTML = "";
+  for (const f of files) {
+    const el = document.createElement("div");
+    el.className = "f";
+    el.textContent = f.name + ": waiting";
+    $("list").appendChild(el);
+    await upload(f, el);
+  }
+};
+</script>
+</body>
+</html>

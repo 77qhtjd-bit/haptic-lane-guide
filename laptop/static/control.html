@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Actuator Control</title>
+<style>
+  body { margin: 0; padding: 16px; background: #111; color: #eee; font: 18px/1.4 system-ui, sans-serif; max-width: 720px; }
+  button { font-size: 22px; padding: 14px 20px; margin: 4px; border: 0; border-radius: 8px; background: #333; color: #fff; }
+  button.on { background: #0a84ff; }
+  input { font-size: 18px; padding: 8px; }
+  input[type=range] { width: 100%; }
+  .row { display: flex; justify-content: space-between; border-bottom: 1px solid #333; padding: 4px 0; }
+  .v { font-weight: 700; font-variant-numeric: tabular-nums; }
+  .bad { color: #ff453a; } .ok { color: #30d158; }
+  h2 { font-size: 18px; color: #aaa; margin: 20px 0 6px; }
+</style>
+</head>
+<body>
+<h2>Arduino</h2>
+<div class="row"><span>Target IP</span><span class="v" id="ip">-</span></div>
+<div class="row"><span>Last HELLO</span><span class="v" id="hello">-</span></div>
+<div>
+  <input id="ipin" placeholder="manual IP, e.g. 172.20.10.5" size="22">
+  <button id="setip">Set IP</button>
+</div>
+
+<h2>Mode</h2>
+<button id="m-manual">Manual</button>
+<button id="m-tilt">Tilt demo</button>
+
+<h2>Manual</h2>
+<button id="left">◀ Left</button>
+<button id="stop">Stop</button>
+<button id="right">Right ▶</button>
+<div>Intensity <span class="v" id="lv">200</span>
+  <input type="range" id="level" min="0" max="255" value="200">
+</div>
+
+<h2>Status</h2>
+<div class="row"><span>Output (left / right)</span><span class="v" id="out">-</span></div>
+<div class="row"><span>Phone roll (+ = left)</span><span class="v" id="roll">-</span></div>
+<div class="row"><span>UDP RTT median / p95 / last</span><span class="v" id="rtt">-</span></div>
+<div class="row"><span>ACKs / lost</span><span class="v" id="acks">-</span></div>
+<div class="row"><span>Phone clock offset</span><span class="v" id="off">-</span></div>
+<div class="row"><span>Log</span><span class="v" id="log" style="font-size:14px">-</span></div>
+<div id="err" class="bad"></div>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const f1 = (x) => (x == null ? "-" : x.toFixed(1));
+let dir = "stop";
+
+async function post(body) {
+  try {
+    const r = await fetch("/api/actuator", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    const d = await r.json();
+    $("err").textContent = r.ok ? "" : (d.error || "HTTP " + r.status);
+    if (r.ok) render(d);
+  } catch (e) { $("err").textContent = e.message; }
+}
+function sendManual() {
+  const v = +$("level").value;
+  post({ left: dir === "left" ? v : 0, right: dir === "right" ? v : 0 });
+}
+$("left").onclick = () => { dir = "left"; sendManual(); };
+$("right").onclick = () => { dir = "right"; sendManual(); };
+$("stop").onclick = () => { dir = "stop"; sendManual(); };
+$("level").oninput = () => { $("lv").textContent = $("level").value; if (dir !== "stop") sendManual(); };
+$("m-manual").onclick = () => { dir = "stop"; post({ mode: "manual", left: 0, right: 0 }); };
+$("m-tilt").onclick = () => post({ mode: "tilt" });
+$("setip").onclick = () => post({ ip: $("ipin").value });
+
+function render(d) {
+  $("ip").textContent = d.target_ip ? `${d.target_ip} (${d.target_source})` : "not found yet";
+  $("ip").className = "v " + (d.target_ip ? "ok" : "bad");
+  $("hello").textContent = d.hello_ip ? `${d.hello_ip}, ${d.hello_age_s.toFixed(0)} s ago` : "none received";
+  $("m-manual").className = d.mode === "manual" ? "on" : "";
+  $("m-tilt").className = d.mode === "tilt" ? "on" : "";
+  for (const k of ["left", "right", "stop"]) $(k).className = d.mode === "manual" && dir === k ? "on" : "";
+  $("out").textContent = `${d.left} / ${d.right}`;
+  $("roll").textContent = d.roll_deg == null ? (d.mode === "tilt" ? "no IMU data" : "-") : d.roll_deg.toFixed(1) + "°";
+  if (d.mode === "frame") $("roll").textContent = "laptop placeholder decide()";
+  $("rtt").textContent = `${f1(d.rtt_median_ms)} / ${f1(d.rtt_p95_ms)} / ${f1(d.rtt_last_ms)} ms`;
+  $("acks").textContent = `${d.acks} / ${d.lost}`;
+  $("off").textContent = d.clock_offset_ms == null ? "-" : d.clock_offset_ms.toFixed(0) + " ms";
+  $("log").textContent = d.log;
+}
+setInterval(async () => {
+  try { render(await (await fetch("/api/actuator", { cache: "no-store" })).json()); }
+  catch (e) { $("err").textContent = "server unreachable: " + e.message; }
+}, 250);
+</script>
+</body>
+</html>

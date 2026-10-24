@@ -1,0 +1,191 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BLE Actuator Test</title>
+<style>
+  body { margin: 0; padding: 12px; background: #000; color: #fff; font: 20px/1.35 -apple-system, system-ui, sans-serif; }
+  button { font-size: 24px; padding: 16px; margin: 4px 0; width: 100%; border-radius: 10px; border: 0; background: #333; color: #fff; }
+  button.on { background: #0a84ff; }
+  #connect { background: #0a84ff; font-size: 30px; padding: 24px; }
+  .three { display: flex; gap: 6px; } .three button { flex: 1; }
+  input[type=range] { width: 100%; }
+  .row { display: flex; justify-content: space-between; border-bottom: 1px solid #333; padding: 4px 0; }
+  .v { font-weight: 700; font-variant-numeric: tabular-nums; }
+  .ok { color: #30d158; } .bad { color: #ff453a; }
+  #errors { color: #ff453a; font-size: 16px; white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<button id="connect">Connect Arduino</button>
+<div class="three">
+  <button id="m-manual" class="on">Manual</button>
+  <button id="m-tilt">Tilt demo</button>
+</div>
+<div class="three">
+  <button id="left">◀ Left</button>
+  <button id="stop">Stop</button>
+  <button id="right">Right ▶</button>
+</div>
+<div>Intensity <span class="v" id="lv">200</span><input type="range" id="level" min="0" max="255" value="200"></div>
+
+<div class="row"><span>BLE</span><span class="v" id="ble">-</span></div>
+<div class="row"><span>Write method</span><span class="v" id="method">-</span></div>
+<div class="row"><span>Output L / R</span><span class="v" id="out">0 / 0</span></div>
+<div class="row"><span>Roll (+ = left)</span><span class="v" id="roll">-</span></div>
+<div class="row"><span>Sent / s</span><span class="v" id="rate">-</span></div>
+<div class="row"><span>RTT median / p95</span><span class="v" id="rtt">-</span></div>
+<div class="row"><span>ACKs / lost / skipped</span><span class="v" id="acks">-</span></div>
+<button id="upload">Upload log to laptop</button>
+<div id="errors"></div>
+
+<script>
+"use strict";
+const SERVICE = "06096ed2-b23b-4ba5-9737-27dba2053749";
+const CMD = "14dd8746-dd9e-4308-8f98-08701035fc46";
+const ACK = "535f34b1-32f0-4532-97d1-18f2fff4bfbe";
+const SEND_HZ = 20, ACK_TIMEOUT_MS = 1000;
+// Same mapping as error_to_command() in actuator.py (keep them in sync).
+const DEADBAND_DEG = 8, HYSTERESIS_DEG = 2, FULL_SCALE_DEG = 30;
+
+const now = () => performance.timeOrigin + performance.now();
+const $ = (id) => document.getElementById(id);
+function err(msg) { console.error(msg); $("errors").textContent = new Date().toLocaleTimeString() + " " + msg + "\n" + $("errors").textContent.slice(0, 600); }
+window.addEventListener("error", (e) => err("JS error: " + e.message));
+window.addEventListener("unhandledrejection", (e) => err("Promise: " + (e.reason && e.reason.message || e.reason)));
+
+let device = null, cmdChar = null, writing = false, useNoResp = false;
+let mode = "manual", dir = "stop", left = 0, right = 0;
+let seq = 0, sentThisSec = 0, acks = 0, lost = 0, skipped = 0;
+const pending = new Map();          // seq (16-bit) -> row
+const rtts = [];                    // last 200
+const log = [];                     // all rows (uploaded on demand)
+let tiltActive = null, lastMotion = null, roll = null;
+
+function errorToCommand(error, active) {
+  const mag = Math.abs(error), side = error > 0 ? "left" : "right";
+  if (active !== null && side !== active) active = null;
+  if (active === null && mag > DEADBAND_DEG) active = side;
+  else if (active !== null && mag < DEADBAND_DEG - HYSTERESIS_DEG) active = null;
+  if (active === null) return [0, 0, null];
+  const v = Math.round(Math.min(255, 255 * mag / FULL_SCALE_DEG));
+  return active === "left" ? [v, 0, active] : [0, v, active];
+}
+// Phone upright in portrait: positive = tilted left (same as roll_from_gravity in actuator.py).
+const rollFromGravity = (gx, gy) => Math.atan2(-gx, -gy) * 180 / Math.PI;
+
+// ---------- BLE ----------
+$("connect").onclick = async () => {
+  if (!navigator.bluetooth) { err("navigator.bluetooth missing (use Bluefy)"); return; }
+  // Motion permission must be requested inside the same tap (iOS).
+  if (typeof DeviceMotionEvent !== "undefined" && typeof DeviceMotionEvent.requestPermission === "function")
+    DeviceMotionEvent.requestPermission().then((p) => { if (p !== "granted") err("motion permission: " + p); }, (e) => err("motion: " + e.message));
+  try {
+    device = await navigator.bluetooth.requestDevice({ filters: [{ services: [SERVICE] }] });
+    device.addEventListener("gattserverdisconnected", () => { cmdChar = null; $("ble").textContent = "disconnected"; $("ble").className = "v bad"; });
+    $("ble").textContent = "connecting...";
+    const server = await device.gatt.connect();
+    const svc = await server.getPrimaryService(SERVICE);
+    cmdChar = await svc.getCharacteristic(CMD);
+    const ackChar = await svc.getCharacteristic(ACK);
+    ackChar.addEventListener("characteristicvaluechanged", onAck);
+    await ackChar.startNotifications();
+    useNoResp = typeof cmdChar.writeValueWithoutResponse === "function";
+    $("method").textContent = useNoResp ? "without response" : "writeValue (with response)";
+    $("ble").textContent = "connected: " + (device.name || "?");
+    $("ble").className = "v ok";
+  } catch (e) {
+    err("BLE: " + e.name + " " + e.message);
+    $("ble").textContent = "failed";
+    $("ble").className = "v bad";
+  }
+};
+
+function onAck(e) {
+  const t = now();
+  const s = e.target.value.getUint16(0, true);
+  const row = pending.get(s);
+  if (!row) return;
+  pending.delete(s);
+  row.ack_t = t;
+  row.rtt_ms = t - row.send_t;
+  rtts.push(row.rtt_ms);
+  if (rtts.length > 200) rtts.shift();
+  acks++;
+}
+
+async function sendCommand() {
+  if (!cmdChar) return;
+  if (writing) { skipped++; return; }     // previous GATT write still in progress
+  seq = (seq + 1) & 0xffff;
+  const buf = new Uint8Array([seq & 0xff, seq >> 8, left, right]);
+  const row = { seq, mode, left, right, imu_t: lastMotion ? lastMotion.t : "", send_t: now(), ack_t: "", rtt_ms: "" };
+  pending.set(seq, row);
+  log.push(row);
+  writing = true;
+  try {
+    if (useNoResp) await cmdChar.writeValueWithoutResponse(buf);
+    else await cmdChar.writeValue(buf);
+    sentThisSec++;
+  } catch (e) {
+    err("write: " + e.message);
+  } finally { writing = false; }
+}
+
+// ---------- Control loop (20 Hz) ----------
+setInterval(() => {
+  if (mode === "tilt") {
+    if (lastMotion && now() - lastMotion.t < 500 && lastMotion.gx != null) {
+      roll = rollFromGravity(lastMotion.gx, lastMotion.gy);
+      [left, right, tiltActive] = errorToCommand(roll, tiltActive);
+    } else { roll = null; left = right = 0; }
+  } else {
+    const v = +$("level").value;
+    left = dir === "left" ? v : 0;
+    right = dir === "right" ? v : 0;
+  }
+  sendCommand();
+  const cutoff = now() - ACK_TIMEOUT_MS;
+  for (const [s, row] of pending) if (row.send_t < cutoff) { pending.delete(s); lost++; }
+}, 1000 / SEND_HZ);
+
+window.addEventListener("devicemotion", (e) => {
+  const g = e.accelerationIncludingGravity || {};
+  lastMotion = { t: now(), gx: g.x, gy: g.y };
+});
+
+// ---------- UI ----------
+function setMode(m) {
+  mode = m; dir = "stop"; tiltActive = null;
+  $("m-manual").className = m === "manual" ? "on" : "";
+  $("m-tilt").className = m === "tilt" ? "on" : "";
+}
+$("m-manual").onclick = () => setMode("manual");
+$("m-tilt").onclick = () => setMode("tilt");
+for (const d of ["left", "right", "stop"]) $(d).onclick = () => { setMode("manual"); dir = d; };
+$("level").oninput = () => { $("lv").textContent = $("level").value; };
+
+setInterval(() => {
+  for (const d of ["left", "right", "stop"]) $(d).className = mode === "manual" && dir === d ? "on" : "";
+  $("out").textContent = `${left} / ${right}`;
+  $("roll").textContent = roll == null ? "-" : roll.toFixed(1) + "°";
+  $("rate").textContent = sentThisSec;
+  sentThisSec = 0;
+  const r = [...rtts].sort((a, b) => a - b);
+  $("rtt").textContent = r.length ? `${r[r.length >> 1].toFixed(0)} / ${r[Math.min(r.length - 1, Math.floor(r.length * 0.95))].toFixed(0)} ms` : "-";
+  $("acks").textContent = `${acks} / ${lost} / ${skipped}`;
+}, 1000);
+
+$("upload").onclick = async () => {
+  try {
+    const r = await fetch("/api/ble_log", { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ userAgent: navigator.userAgent, method: useNoResp ? "without_response" : "with_response", rows: log }) });
+    const d = await r.json();
+    $("upload").textContent = r.ok ? `Uploaded ${log.length} rows` : "Upload failed";
+    if (!r.ok) err("upload: " + (d.error || r.status));
+  } catch (e) { err("upload: " + e.message); }
+};
+</script>
+</body>
+</html>
