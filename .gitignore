@@ -1,0 +1,12 @@
+.env
+.env.*
+!.env.example
+.DS_Store
+# Xcode
+build/
+DerivedData/
+xcuserdata/
+*.xcuserstate
+# Python (log analysis)
+__pycache__/
+.venv/
