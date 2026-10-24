@@ -238,6 +238,28 @@ function halfMaxWidth(s, i) {
   return r - l + 1;
 }
 
+// Default forward segments (m) for curve fitting: one lateral histogram per segment.
+export const CURVE_SEGMENTS = [[1, 2], [2, 3], [3, 4], [4, 5.5]];
+
+// Line peaks per forward segment of heading-aligned ground points, for fitting curved lines.
+// x is the mean forward distance of the segment's points (points thin out with distance, so the
+// segment midpoint would bias a curve fit).
+export function segmentPeaks(points, count, { segments = CURVE_SEGMENTS, yHalf = 3, bin = 0.02 } = {}, peakOpts = {}) {
+  return segments.map(([xMin, xMax]) => {
+    let sum = 0;
+    let n = 0;
+    for (let i = 0; i < count; i++) {
+      const x = points[2 * i];
+      if (x >= xMin && x <= xMax) {
+        sum += x;
+        n++;
+      }
+    }
+    const H = lateralHistogram(points, count, { xMin, xMax, yHalf, bin });
+    return { x: n ? sum / n : (xMin + xMax) / 2, peaks: findPeaks(H, { minCount: 2, ...peakOpts }) };
+  });
+}
+
 // Ground coordinates scale linearly with h, and the lane width is known, so the spacing of
 // adjacent peaks re-estimates the true camera height (running bounce, wrong initial guess).
 // Returns null if no adjacent pair looks like one lane.

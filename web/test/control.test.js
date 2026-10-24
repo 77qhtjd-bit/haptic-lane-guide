@@ -108,6 +108,14 @@ test('controller: heading error alone steers before the offset grows', () => {
   assert.equal(cmd.motors, motorBit(2));
 });
 
+test('controller: curvature feedforward leans the cue into the bend', () => {
+  const ctl = new HapticController();
+  const straight = ctl.effort({ eY: 0, vY: 0, ePsi: 0 }, 0);
+  const rightBend = ctl.effort({ eY: 0, vY: 0, ePsi: 0 }, 1 / 10);
+  assert.equal(straight, 0);
+  assert.ok(rightBend < 0, 'right bend should push the cue right (u < 0)');
+});
+
 test('controller: hysteresis stops the cue flickering on a threshold', () => {
   const ctl = new HapticController();
   const motors = [];

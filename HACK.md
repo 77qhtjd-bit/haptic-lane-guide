@@ -33,7 +33,7 @@
 3. Runner drifts right; the left-side motor(s) vibrate, stronger the farther they drift (proportional, not on/off).
 4. Runner corrects; vibration fades to silence = "you're centered". Moment of value: a blindfolded judge stays inside the lane on our self-built demo track.
 
-Done means: a blindfolded person walks our self-built demo track live, guided only by the belt, while the screen shows the lane overlay and lateral error; shaking the phone does not make the belt chatter.
+Done means: a blindfolded person walks our self-built demo track (a straight AND a curved taped lane) live, guided only by the belt, while the screen shows the lane overlay and lateral error; shaking the phone does not make the belt chatter.
 
 Proof for judges: lateral-error RMS (cm) on the same lane with (a) no feedback, (b) audio feedback, (c) our belt, as one chart. Belt has an LED next to each motor so judges can see the feedback.
 
@@ -45,7 +45,7 @@ Proof for judges: lateral-error RMS (cm) on the same lane with (a) no feedback, 
 - Glasses / head-mounted form factor: head moves too much; chest mount is the stable choice.
 - Raspberry Pi / external display on the device: phone already has camera + gyro + compute.
 - Companion app UI, login, settings, onboarding: one start button, fixed tuned parameters.
-- Lane-change and track-curve handling beyond gentle curves: demo straight + slight curve only.
+- Lane changes (moving to another lane on purpose): not in the journey. Track curves ARE in scope (team decision Sat: the demo must show a curve).
 - Night / rain / any lighting robustness beyond the demo conditions.
 - Google Maps / GPS: GPS error is meters, a lane is 1.22m; useless for lane keeping.
 - All AI APIs (Gemini/Claude/Grok), in or out of the control loop: cut from the MVP (team decision, Sat). Revisit only if a track requires it after the core loop works.
@@ -98,3 +98,4 @@ Mocked, hardcoded, or seeded parts we will disclose in the demo:
 - Sat Yaw heading search added (findHeading; doubles as e_psi). Lane lock + tracking added: web/lane/tracker.js (gated L/R association, one-line fallback, coast ~1s then LOST, outside-left/right instead of re-locking a neighbor lane); spike page has Lock lane button, green locked-lane fill + yellow centerline. 21 node tests pass. Not yet run on a real phone. Next: Kalman + PD + 5-motor mapping.
 - Sat Step 3 done: web/control (Kalman [eY,vY,ePsi] with gyro prediction + outlier gate, PD+heading controller, 5-motor zones with hysteresis, 8-byte BLE packet), firmware/belt_r4 (ArduinoBLE, local pulse timing, 300ms watchdog, Serial Plotter output; compiles for UNO R4 WiFi). OpenCV.js vendored (docs.opencv.org 4.10.0 URL was 404) + network-first service worker. FIXED: page froze on load since step 1 (OpenCV module is a thenable; returning it from async looped forever). Headless Chrome smoke test: ~20fps, <1ms/frame, no errors. 33 node tests pass. Not yet on a real phone or belt.
 - Sat Adopted the team's measured BLE pipeline (docs/phone-pipeline.md: frame->board 46 ms median): firmware/lane_actuator_ble (LaneActuator, [seq, L1..L5], ACK, 300 ms watchdog) replaces my belt_r4; protocol.js maps controller output to per-motor pulse levels and ports the auto-reconnect/stall logic. Added run logger (CSV with L1..L5, imu_age_ms; RMS per condition), audio comparison cue, tilt-to-drift simulation (no lane needed), IMU-stall handling. FIXED: Kalman outlier gate could lock onto a stale state forever (now re-inits after 5 rejects in a row). 40 node tests pass; headless sim sweep gives M3 heartbeat / M2,M4 small / M1,M5 big as expected.
+- Sat Curves (branch curve-fit): per-segment peaks (1-2/2-3/3-4/4-5.5 m) + joint quadratic fit of both lines -> eY, ePsi vs tangent, curvature; curvature feedforward in the controller; curved overlay. Found + fixed: at 120 px a 5 cm line beyond 2 m was erased by the 3x3 open, so only 1-2 m was used; now 240x320 + 2x2 open (~2 ms/frame). OpenCV synthetic R=36.5 m bend -> R 38-39 m, eY within 1 cm; straight accuracy 2.5 -> <1 cm. 46 node tests pass.

@@ -16,6 +16,8 @@ export const DEFAULT_CONTROL_CONFIG = {
   kd: 0.3, // s, on vY
   kPsi: 0.8, // m per rad of heading error (10 deg -> 0.14 m)
   reactionTime: 0.25, // s: look ahead by the runner's reaction delay
+  curveLookahead: 1.5, // m: on a bend, steer toward where the lane will be this far ahead
+  kCurve: 1.0,
   deadband: 0.15, // m of |u|: silent zone (heartbeat only)
   strong: 0.35, // m of |u|: big-turn zone starts here
   hysteresis: 0.05, // m: leave a zone only this far below its entry threshold
@@ -36,13 +38,15 @@ export class HapticController {
   }
 
   // Control effort in meters: + = runner is (or is heading) right of where they should be.
-  effort({ eY, vY = 0, ePsi = 0 }) {
-    const { kp, kd, kPsi, reactionTime } = this.cfg;
-    return kp * (eY + vY * reactionTime) + kd * vY + kPsi * ePsi;
+  // Curvature feedforward: on a right bend (curvature > 0) the lane moves right by about
+  // curvature/2 * L^2 within the next L meters, so the cue leans right before eY grows.
+  effort({ eY, vY = 0, ePsi = 0 }, curvature = 0) {
+    const { kp, kd, kPsi, reactionTime, curveLookahead: L, kCurve } = this.cfg;
+    return kp * (eY + vY * reactionTime) + kd * vY + kPsi * ePsi - kCurve * (curvature / 2) * L * L;
   }
 
-  // state: LaneEstimator.state; status: LaneTracker status. Returns the command for the belt.
-  step(state, status) {
+  // state: LaneEstimator.state; status: LaneTracker status; curvature: LaneTracker curvature (1/m).
+  step(state, status, curvature = 0) {
     const c = this.cfg;
     if (status === LaneStatus.UNLOCKED) {
       this.zone = 0;
@@ -60,7 +64,7 @@ export class HapticController {
       };
     }
 
-    const u = this.effort(state);
+    const u = this.effort(state, curvature);
     let goLeft = u > 0;
     const mag = Math.abs(u);
     if (status === LaneStatus.OUTSIDE_LEFT || status === LaneStatus.OUTSIDE_RIGHT) {

@@ -316,7 +316,7 @@ function run(cv, video) {
     const res = detector.process(rgba, up, prevHeading);
     rgba.delete();
     latest = res;
-    const lane = tracker.update(res.ok ? res.peaks : [], res.ok ? res.heading : tracker.heading);
+    const lane = tracker.update(res.ok ? res.peaks : [], res.ok ? res.heading : tracker.heading, res.ok ? res.segments : []);
     // Once locked, the lane's own heading is the better prior than whatever the last frame found.
     if (tracker.locked && lane.status !== LaneStatus.LOST) prevHeading = lane.heading;
     else prevHeading = res.ok && res.peaks.length ? res.heading : 0;
@@ -335,7 +335,7 @@ function run(cv, video) {
       kf = estimator.update(lane.eY, lane.ePsi, lane.confidence * (staleAttitude ? 0.4 : 1));
     }
     const state = estimator.initialized ? estimator.state : { eY: lane.eY ?? 0, vY: 0, ePsi: lane.ePsi ?? 0 };
-    const cmd = controller.step(state, lane.status);
+    const cmd = controller.step(state, lane.status, lane.curvature ?? 0);
     // The belt only vibrates in belt runs; it still gets all-zero commands otherwise, so the board keeps a live link.
     const condition = $('condition').value;
     const levels = commandToLevels(cmd);
@@ -347,6 +347,7 @@ function run(cv, video) {
       confidence: lane.confidence ?? 0,
       eY_raw_m: lane.eY,
       ePsi_raw_rad: lane.ePsi,
+      curvature_1pm: lane.curvature,
       eY_kf_m: state.eY,
       vY_kf_mps: state.vY,
       ePsi_kf_rad: state.ePsi,
@@ -392,7 +393,7 @@ function run(cv, video) {
       `jitter 2s (std, cm)  L ${cm(std(jitter.left))}  R ${cm(std(jitter.right))}   target < 10`,
       `h estimate ${res.heightEstimate ? res.heightEstimate.toFixed(2) + ' m' : '-'}`,
       tracker.locked
-        ? `lane L ${cm(lane.leftY)} R ${cm(lane.rightY)} width ${cm(lane.width)}  matched ${lane.matched.left ? 'L' : '-'}${lane.matched.right ? 'R' : '-'}  conf ${lane.confidence.toFixed(2)}`
+        ? `lane curve ${lane.curvature && Math.abs(lane.curvature) > 0.005 ? `R ${(1 / lane.curvature).toFixed(0)} m (${lane.curvature > 0 ? 'right' : 'left'})` : 'straight'}  L ${cm(lane.leftY)} R ${cm(lane.rightY)} width ${cm(lane.width)}  matched ${lane.matched.left ? 'L' : '-'}${lane.matched.right ? 'R' : '-'}  conf ${lane.confidence.toFixed(2)}`
         : 'lane: tap Lock lane while standing in the middle of your lane',
       estimator.initialized
         ? `kalman eY ${cm(state.eY)} vY ${cm(state.vY)}/s ePsi ${((state.ePsi * 180) / Math.PI).toFixed(1)}° ±${cm(state.sigmaY)}  ${kf && !kf.accepted ? 'REJECTED outlier' : ''}`
@@ -427,8 +428,11 @@ const alongLane = (t, y, heading) => [
 function drawLockedLane(ctx, toScreen, lane) {
   if (lane.status === LaneStatus.UNLOCKED || lane.status === LaneStatus.LOST) return;
   const ts = [];
-  for (let t = 1; t <= 6; t += 0.25) ts.push(t);
-  const edge = (y) => ts.map((t) => toScreen(...alongLane(t, y, lane.heading))).filter(Boolean);
+  for (let t = 1; t <= 5.5; t += 0.25) ts.push(t);
+  const { b = 0, c = 0 } = lane.shape ?? {};
+  // Fitted lane shape in the aligned frame: y(x) = center + b·x + c·x² (+ offset for each line).
+  const edge = (offset) =>
+    ts.map((t) => toScreen(...alongLane(t, offset + b * t + c * t * t, lane.heading))).filter(Boolean);
   const left = edge(lane.leftY);
   const right = edge(lane.rightY).reverse();
   if (left.length > 1 && right.length > 1) {
