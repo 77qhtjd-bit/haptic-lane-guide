@@ -281,6 +281,8 @@ function processFrame(mediaTime) {
     det_segments_with_peaks: res.ok && res.segments ? res.segments.filter((g) => g.peaks && g.peaks.length).length : 0,
     det_heading_deg: res.ok ? +((res.heading * 180) / Math.PI).toFixed(2) : '',
     near_peak_y: res.ok && res.peaks.length ? res.peaks.map((p) => p.y.toFixed(2)).join(' ') : '',
+    seg_peaks: res.ok && res.segments ? res.segments.map((g) => `${g.x.toFixed(1)}:${g.peaks.map((p) => p.y.toFixed(2)).join('/')}`).join(' ') : '',
+    trk: tracker.locked ? [tracker.center, tracker.slope, tracker.curve, tracker.width].map((v) => v.toFixed(3)).join('/') : '',
     reason: res.ok ? '' : res.reason,
   });
 
