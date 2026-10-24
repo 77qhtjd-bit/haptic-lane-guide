@@ -338,7 +338,7 @@ function run(cv, video) {
     const res = detector.process(rgba, up, prevHeading);
     rgba.delete();
     latest = res;
-    const lane = tracker.update(res.ok ? res.peaks : [], res.ok ? res.heading : tracker.heading, res.ok ? res.segments : []);
+    const lane = tracker.update(res.ok ? res.peaks : [], res.ok ? res.heading : tracker.heading, res.ok ? res.segments : [], res.ok ? { pts: res.aligned, count: res.ground.count } : null);
     // Once locked, the lane's own heading is the better prior than whatever the last frame found.
     if (tracker.locked && lane.status !== LaneStatus.LOST) prevHeading = lane.heading;
     else prevHeading = res.ok && res.peaks.length ? res.heading : 0;

@@ -256,3 +256,21 @@ test('after coasting, a sudden centerline jump is held until it persists (jumpFr
   const out = t.update([], 0, segmentsFor(0.34));
   close(out.eY, 0, 0.05);
 });
+
+test('a crossing diagonal (staggered start line) is not taken as the lane line', () => {
+  const t = new LaneTracker();
+  assert.ok(t.lock([], 0, segmentsFor(0)));
+  // Ground points: both lane lines straight at ±0.61, except the right line is not visible around
+  // x = 3.4 where a start line crosses at a 27° angle; its peak sits 9 cm inside the right line.
+  const pts = [];
+  for (let x = 1.0; x <= 5.5; x += 0.05) {
+    pts.push(x, -0.61);
+    if (x < 2.9 || x > 3.9) pts.push(x, 0.61);
+  }
+  for (let x = 3.0; x <= 3.8; x += 0.02) pts.push(x, 0.52 + 0.5 * (x - 3.4));
+  const segs = segmentsFor(0).map((s) => (s.x === 3.4 ? { ...s, peaks: s.peaks.map((p) => (Math.abs(p.y - 0.61) < 0.05 ? { ...p, y: 0.52 } : p)) } : s));
+  const out = t.update([], 0, segs, { pts: Float32Array.from(pts), count: pts.length / 2 });
+  assert.ok(!out.polylines.right.some((p) => p.x === 3.4), 'diagonal point dropped');
+  assert.ok(out.polylines.right.length >= 2, 'right line still matched');
+  close(out.eY, 0, 0.02);
+});
