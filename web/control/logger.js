@@ -7,8 +7,8 @@ export const Condition = Object.freeze({ NONE: 'none', AUDIO: 'audio', BELT: 'be
 
 export const CSV_COLUMNS = [
   't_ms', 'condition', 'status', 'confidence',
-  'eY_raw_m', 'ePsi_raw_rad', 'eY_kf_m', 'vY_kf_mps', 'ePsi_kf_rad',
-  'u_m', 'zone', 'motors', 'period_ms', 'L1', 'L2', 'L3', 'L4', 'L5', 'imu_age_ms', 'fps',
+  'eY_raw_m', 'ePsi_raw_rad', 'curvature_1pm', 'eY_kf_m', 'vY_kf_mps', 'ePsi_kf_rad',
+  'lane_width_m', 'matched', 'u_m', 'zone', 'cue', 'motors', 'period_ms', 'L1', 'L2', 'L3', 'L4', 'L5', 'imu_age_ms', 'fps',
 ];
 
 const STORAGE_KEY = 'laneguide.runs.v1';

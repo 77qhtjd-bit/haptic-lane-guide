@@ -151,6 +151,20 @@ test('heading search follows a prior outside its own range', () => {
   close(heading, deg(32), deg(1));
 });
 
+test('a broad white area on the floor is not a line, and does not hide the real lines', () => {
+  const basis = groundBasis(deviceToCamera(upFromOrientation(65, 0)));
+  const lines = renderLines([-0.61, 0.61], basis, 1.3);
+  // White floor patch from y = 1.0 to 2.2 m (much brighter/larger than the lines).
+  const patch = [];
+  for (let x = 1; x <= 4; x += 0.02) for (let y = 1.0; y <= 2.2; y += 0.01) patch.push(x, y);
+  const pts = new Float32Array(lines.count * 2 + patch.length);
+  const g = projectToGround(lines.pixels, lines.count, K, basis, 1.3);
+  pts.set(g.points.subarray(0, g.count * 2));
+  pts.set(patch, g.count * 2);
+  const peaks = findPeaks(lateralHistogram(pts, g.count + patch.length / 2));
+  assertLines(peaks, [-0.61, 0.61], [], 0.02);
+});
+
 test('lane width re-estimates a wrong camera height', () => {
   const peaks = detect([-1.83, -0.61, 0.61, 1.83], { hTrue: 1.3, hAssumed: 1.1 });
   close(estimateHeight(peaks, 1.1), 1.3, 0.03);

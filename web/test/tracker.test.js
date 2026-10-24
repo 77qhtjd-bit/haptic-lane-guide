@@ -110,3 +110,74 @@ test('heading error has the right sign', () => {
   const out = t.update(peaksFor(0), (5 * Math.PI) / 180);
   close(out.ePsi, (-5 * Math.PI) / 180, 1e-12);
 });
+
+// ---- Sliding window over forward segments (what the detector gives the tracker) ----
+
+// Segments 1-2 / 2-3 / 3-4 / 4-5.5 m with the lane lines of a track (spacing `width`) seen from a
+// runner at runnerY; `extra` adds junk peaks as { x, y } (only in the segment containing x).
+function segmentsFor(runnerY, { width = 1.22, slope = 0, extra = [] } = {}) {
+  return [1.4, 2.4, 3.4, 4.6].map((x) => {
+    const peaks = [];
+    for (let k = -3; k <= 3; k++) {
+      const y = k * width - width / 2 - runnerY + slope * x;
+      if (Math.abs(y) <= 2.2) peaks.push({ y, strength: 50 });
+    }
+    for (const e of extra) if (Math.abs(e.x - x) < 0.5) peaks.push({ y: e.y, strength: 80 });
+    return { x, peaks: peaks.sort((a, b) => a.y - b.y) };
+  });
+}
+
+test('lock with segments takes the lines just left and right of the runner, not neighbor lanes', () => {
+  const t = new LaneTracker();
+  assert.ok(t.lock([], 0, segmentsFor(0.2)));
+  close(t.last.eY, 0.2, 1e-9);
+  close(t.last.width, 1.22, 1e-9);
+  assert.equal(t.last.polylines.left.length, 4);
+  assert.equal(t.last.polylines.right.length, 4);
+});
+
+test('a short white thing near the runner (chair leg) is not a lane line', () => {
+  const t = new LaneTracker();
+  // A leg 50 cm right of the runner, seen only in the nearest segment: it would pass the width
+  // check with the left line, but it does not continue, so the real lines are locked instead.
+  assert.ok(t.lock([], 0, segmentsFor(0, { extra: [{ x: 1.4, y: 0.5 }] })));
+  close(t.last.rightY, 0.61, 1e-9);
+  // While locked, the same leg inside the lane does not move it.
+  const out = t.update([], 0, segmentsFor(0, { extra: [{ x: 1.4, y: 0.45 }, { x: 2.4, y: -0.4 }] }));
+  close(out.eY, 0, 0.01);
+  assert.deepEqual(out.matched, { left: true, right: true });
+});
+
+test('no lane: nothing to lock when the lines do not continue over two segments', () => {
+  const t = new LaneTracker();
+  const scattered = [1.4, 2.4, 3.4, 4.6].map((x, i) => ({ x, peaks: [{ y: -0.6 + 0.4 * i, strength: 30 }, { y: 0.7 - 0.5 * i, strength: 30 }] }));
+  assert.equal(t.candidate(scattered), null);
+  assert.equal(t.lock([], 0, scattered), false);
+});
+
+test('lane width is a range: default fits a real track, a 0.5-1.0 m range fits taped practice lanes', () => {
+  assert.equal(new LaneTracker().lock([], 0, segmentsFor(0, { width: 0.73 })), false);
+  assert.ok(new LaneTracker().lock([], 0, segmentsFor(0, { width: 1.22 })));
+  const practice = { minWidth: 0.5, maxWidth: 1.0 };
+  for (const width of [0.55, 0.73, 0.95]) {
+    const t = new LaneTracker(practice);
+    assert.ok(t.lock([], 0, segmentsFor(0.1, { width })), `width ${width}`);
+    close(t.last.width, width, 1e-9);
+    close(t.last.eY, 0.1, 1e-9);
+  }
+  assert.equal(new LaneTracker(practice).lock([], 0, segmentsFor(0, { width: 1.22 })), false);
+});
+
+test('sliding window follows a lane that bends away and keeps the lines when one segment is missing', () => {
+  const t = new LaneTracker();
+  assert.ok(t.lock([], 0, segmentsFor(0)));
+  let out;
+  for (let i = 0; i < 10; i++) {
+    const segs = segmentsFor(0, { slope: 0.08 }); // lines drift 8 cm per meter to the right
+    segs[2].peaks = []; // e.g. a shadow over 3-4 m
+    out = t.update([], 0, segs);
+  }
+  assert.equal(out.polylines.right.length, 3);
+  close(out.eY, 0, 0.02);
+  close(out.ePsi, -Math.atan(0.08), 0.02); // lane points right of the runner
+});
