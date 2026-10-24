@@ -141,6 +141,10 @@ test('at large yaw, heading and the line still in view are recovered', () => {
   }
 });
 
+test('heading search with no points keeps the prior', () => {
+  assert.equal(findHeading(new Float32Array(0), 0, undefined, { center: 0.1 }), 0.1);
+});
+
 test('heading search follows a prior outside its own range', () => {
   const ground = groundPoints([-0.61, 0.61], { laneHeading: deg(32) });
   const heading = findHeading(ground.points, ground.count, undefined, { center: deg(28) });
