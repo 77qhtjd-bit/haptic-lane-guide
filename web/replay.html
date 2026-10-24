@@ -28,17 +28,17 @@
   <button id="lockBtn" disabled>Lock lane</button>
   <button id="restart" disabled>Restart</button>
   <button id="stepBtn" disabled>Step all frames</button>
-  <label>speed <select id="speed"><option>0.25</option><option>0.5</option><option selected>1</option><option>2</option></select></label>
+  <label>speed <select id="speed"><option>0.25</option><option>0.5</option><option selected>1</option><option>2</option><option value="max">max (step only)</option></select></label>
   <label><input type="checkbox" id="autolock" checked> auto lock / re-lock after lost</label>
   <button id="csv" disabled>Download CSV</button>
   <button id="sumBtn" disabled>Download summary</button>
 </div>
 <div class="row">
-  <label>h(m) <input id="h" type="number" step="0.05" value="1.3"></label>
+  <label>h(m) <input id="h" type="number" step="0.05" value="1.5"></label>
   <label>hfov <input id="hfov" type="number" step="1" value="53"></label>
   <label>Vmin <input id="vmin" type="number" step="5" value="180"></label>
   <label>Smax <input id="smax" type="number" step="5" value="60"></label>
-  <label>lag(ms) <input id="lag" type="number" step="10" value="30"></label>
+  <label>lag(ms) <input id="lag" type="number" step="10" value="60"></label>
   <label>lane width(m) <input id="laneMin" type="number" step="0.05" value="0.6"> ~ <input id="laneMax" type="number" step="0.05" value="1.3"></label>
   <span id="clipinfo"></span>
 </div>
@@ -64,7 +64,7 @@ import { HapticController } from './control/controller.js';
 import { commandToLevels } from './control/protocol.js';
 import { candidateLane, cueText, drawView, drawBev } from './lane/draw.js';
 
-const PAGE_VERSION = "replay-2";
+const PAGE_VERSION = "replay-3";
 const $ = (id) => document.getElementById(id);
 const log = (msg) => { $('log').textContent = `${msg}\n` + $('log').textContent; };
 window.addEventListener('error', (e) => log(`error: ${e.message}`));
@@ -395,10 +395,12 @@ video.addEventListener('ended', () => { $('play').textContent = 'Play'; showSumm
 setInterval(() => { if (rec && rows.length) showSummary(); }, 1000);
 
 $('play').onclick = () => {
+  if (stepping) { stepping = false; return; }
+  if ($('speed').value === 'max') { log('"max" is for Step all frames; using 2x for Play'); $('speed').value = '2'; }
   if (video.paused) { video.playbackRate = +$('speed').value; video.play(); $('play').textContent = 'Pause'; }
   else { video.pause(); $('play').textContent = 'Play'; }
 };
-$('speed').onchange = () => { video.playbackRate = +$('speed').value; };
+$('speed').onchange = () => { if ($('speed').value !== 'max') video.playbackRate = +$('speed').value; };
 $('lockBtn').onclick = () => log(tryLock() ? `locked: width ${(tracker.width * 100).toFixed(0)} cm` : 'lock failed (no lane candidate in this frame)');
 $('restart').onclick = () => { video.pause(); video.currentTime = 0; resetPipeline(); $('play').textContent = 'Play'; };
 function download(name, text, type) {
@@ -417,7 +419,8 @@ $('csv').onclick = () => download(`${rec.name}_replay.csv`, toCsv(), 'text/csv')
 $('sumBtn').onclick = () => download(`${rec.name}_replay_summary.json`, JSON.stringify(summarize(), null, 2), 'application/json');
 
 // Step mode (?step=1 or the Step all button): seek through the clip one frame at a time and process
-// every frame, so results do not depend on playback speed or machine load.
+// every frame, so results do not depend on playback speed or machine load. Paced to the selected
+// speed (1 = real time); "max" runs as fast as the machine allows. Play/Pause stops it.
 function nextPresentedFrame() {
   return new Promise((resolve) => {
     let done = false;
@@ -425,21 +428,33 @@ function nextPresentedFrame() {
     video.addEventListener('seeked', () => setTimeout(() => { if (!done) { done = true; resolve(video.currentTime); } }, 200), { once: true });
   });
 }
+let stepping = false;
 async function stepAll() {
   video.pause();
   resetPipeline();
+  stepping = true;
+  $('play').textContent = 'Stop step';
   const dt = 1 / 30;
-  for (let t = dt / 2; t < video.duration; t += dt) {
+  for (let t = dt / 2; t < video.duration && stepping; t += dt) {
+    const wallStart = performance.now();
     video.currentTime = t;
     const mt = await nextPresentedFrame();
     if (mt !== lastMediaTime) {
       lastMediaTime = mt;
       try { processFrame(mt); } catch (e) { log(`frame error: ${e.message}`); }
     }
+    const speed = $('speed').value;   // read every frame, so a change applies immediately
+    if (speed !== 'max') {
+      const wait = (dt * 1000) / +speed - (performance.now() - wallStart);
+      if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+    }
   }
+  const finished = stepping;
+  stepping = false;
+  $('play').textContent = 'Play';
   showSummary();
-  window.replayDone = true;
-  log('step mode: end of clip');
+  if (finished) { window.replayDone = true; log('step mode: end of clip'); }
+  else log('step mode: stopped');
 }
 
 // Exposed for headless runs.
