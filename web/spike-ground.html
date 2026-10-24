@@ -390,7 +390,7 @@ function run(cv, video) {
     lastT = now;
 
     const shown = tracker.locked ? lane : candidate && candidateLane(candidate, res.heading);
-    drawView(vctx, img, detector, res, shown, cue);
+    drawView(vctx, img, detector, res, shown, cue, tracker.locked && lane.status !== LaneStatus.LOST ? controller.aimPoint(state, lane.curvature ?? 0) : null);
     drawBev($('bev'), res, shown);
     drawHist($('hist'), res);
 
@@ -538,7 +538,7 @@ function interp(chain, x) {
   return a.y + ((b.y - a.y) * (x - a.x)) / (b.x - a.x);
 }
 
-function drawView(ctx, img, detector, res, lane, cue) {
+function drawView(ctx, img, detector, res, lane, cue, aim) {
   const s = 2;
   const tmp = new OffscreenCanvas(img.width, img.height);
   const tctx = tmp.getContext('2d');
@@ -558,6 +558,17 @@ function drawView(ctx, img, detector, res, lane, cue) {
       const px = groundToPixel(x, y, detector.K, res.basis, detector.cfg.cameraHeight);
       return px && [px[0] * s, px[1] * s];
     }, lane);
+    // Pure-pursuit aim point (orange): the belt steers the runner toward it.
+    const a = aim && groundToPixel(aim.x, aim.y, detector.K, res.basis, detector.cfg.cameraHeight);
+    if (a) {
+      ctx.fillStyle = '#f80';
+      ctx.strokeStyle = '#000';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.arc(a[0] * s, a[1] * s, 9, 0, 2 * Math.PI);
+      ctx.fill();
+      ctx.stroke();
+    }
   }
   if (cue) {
     ctx.font = `bold ${Math.round(ctx.canvas.width / 9)}px -apple-system, system-ui, sans-serif`;

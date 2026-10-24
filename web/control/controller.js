@@ -14,10 +14,11 @@ export const motorBit = (n) => 1 << (n - 1);
 export const DEFAULT_CONTROL_CONFIG = {
   kp: 1.0, // on predicted eY (m -> m)
   kd: 0.3, // s, on vY
-  kPsi: 0.8, // m per rad of heading error (10 deg -> 0.14 m)
   reactionTime: 0.25, // s: look ahead by the runner's reaction delay
-  curveLookahead: 1.5, // m: on a bend, steer toward where the lane will be this far ahead
-  kCurve: 1.0,
+  // Pure pursuit: aim at the centerline point this far ahead. Heading error and curvature both act
+  // through it, so on a bend the cue already says "turn" while the runner is still centered
+  // (with 1.5 m and no shared aim point, a 12 m bend stayed under the deadband and read STRAIGHT).
+  lookahead: 2.5, // m
   deadband: 0.15, // m of |u|: silent zone (heartbeat only)
   strong: 0.35, // m of |u|: big-turn zone starts here
   hysteresis: 0.05, // m: leave a zone only this far below its entry threshold
@@ -37,12 +38,21 @@ export class HapticController {
     this.zone = 0; // 0 straight, 1 small turn, 2 big turn
   }
 
-  // Control effort in meters: + = runner is (or is heading) right of where they should be.
-  // Curvature feedforward: on a right bend (curvature > 0) the lane moves right by about
-  // curvature/2 * L^2 within the next L meters, so the cue leans right before eY grows.
-  effort({ eY, vY = 0, ePsi = 0 }, curvature = 0) {
-    const { kp, kd, kPsi, reactionTime, curveLookahead: L, kCurve } = this.cfg;
-    return kp * (eY + vY * reactionTime) + kd * vY + kPsi * ePsi - kCurve * (curvature / 2) * L * L;
+  // Lateral position (m, + = right) of the aim point: the centerline `lookahead` meters ahead, seen
+  // from the runner's straight-ahead path. Centerline at the runner is at -eY, its direction is
+  // -ePsi relative to the runner, and it bends by curvature/2 * L^2 over L meters.
+  aimPoint({ eY, ePsi = 0 }, curvature = 0) {
+    const L = this.cfg.lookahead;
+    return { x: L, y: -eY - Math.tan(ePsi) * L + (curvature / 2) * L * L };
+  }
+
+  // Control effort in meters: + = the runner should move left. Pure pursuit toward the aim point,
+  // plus a damping term on lateral speed and the reaction-time lead on eY.
+  effort(state, curvature = 0) {
+    const { kp, kd, reactionTime } = this.cfg;
+    const vY = state.vY ?? 0;
+    const aim = this.aimPoint({ ...state, eY: state.eY + vY * reactionTime }, curvature);
+    return -kp * aim.y + kd * vY;
   }
 
   // state: LaneEstimator.state; status: LaneTracker status; curvature: LaneTracker curvature (1/m).

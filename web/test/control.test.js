@@ -103,17 +103,25 @@ test('controller: small and big errors use motors 2/4 and 1/5 toward the lane ce
 });
 
 test('controller: heading error alone steers before the offset grows', () => {
-  // Centered but pointing 15 deg right -> move left.
-  const cmd = new HapticController().step({ eY: 0, vY: 0, ePsi: 15 * DEG }, LaneStatus.INSIDE);
+  // Centered but pointing 5 deg right -> move left (aim point 22 cm left at 2.5 m).
+  const cmd = new HapticController().step({ eY: 0, vY: 0, ePsi: 5 * DEG }, LaneStatus.INSIDE);
   assert.equal(cmd.motors, motorBit(2));
 });
 
-test('controller: curvature feedforward leans the cue into the bend', () => {
+test('controller: centered on a 12 m bend, the cue already says turn into the bend', () => {
   const ctl = new HapticController();
-  const straight = ctl.effort({ eY: 0, vY: 0, ePsi: 0 }, 0);
-  const rightBend = ctl.effort({ eY: 0, vY: 0, ePsi: 0 }, 1 / 10);
-  assert.equal(straight, 0);
-  assert.ok(rightBend < 0, 'right bend should push the cue right (u < 0)');
+  assert.equal(ctl.effort({ eY: 0, vY: 0, ePsi: 0 }, 0), 0);
+  // Right bend: small right turn (motor 4), not STRAIGHT. Left bend: motor 2.
+  assert.equal(new HapticController().step({ eY: 0, vY: 0, ePsi: 0 }, LaneStatus.INSIDE, 1 / 12).motors, motorBit(4));
+  assert.equal(new HapticController().step({ eY: 0, vY: 0, ePsi: 0 }, LaneStatus.INSIDE, -1 / 12).motors, motorBit(2));
+  // A gentle track bend (R 36.5 m) alone stays quiet.
+  assert.equal(new HapticController().step({ eY: 0, vY: 0, ePsi: 0 }, LaneStatus.INSIDE, 1 / 36.5).motors, motorBit(3));
+});
+
+test('controller: aim point is the centerline ahead as seen from the runner', () => {
+  const ctl = new HapticController();
+  close(ctl.aimPoint({ eY: 0.2, ePsi: 0 }).y, -0.2, 1e-12); // runner right of center -> aim left
+  close(ctl.aimPoint({ eY: 0, ePsi: 0.1 }).y, -Math.tan(0.1) * 2.5, 1e-12); // pointing right -> aim left
 });
 
 test('controller: hysteresis stops the cue flickering on a threshold', () => {
