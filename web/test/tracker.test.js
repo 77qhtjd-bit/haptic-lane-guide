@@ -274,3 +274,19 @@ test('a crossing diagonal (staggered start line) is not taken as the lane line',
   assert.ok(out.polylines.right.length >= 2, 'right line still matched');
   close(out.eY, 0, 0.02);
 });
+
+test('a line the peaks missed is filled by tracing the ground points', () => {
+  const t = new LaneTracker();
+  assert.ok(t.lock([], 0, segmentsFor(0)));
+  // Peaks: the right line missing in every segment (e.g. washed out); the ground points still show it.
+  const segs = segmentsFor(0).map((s) => ({ ...s, peaks: s.peaks.filter((p) => Math.abs(p.y - 0.61) > 0.05) }));
+  const pts = [];
+  for (let x = 1.0; x <= 5.5; x += 0.05) pts.push(x, -0.61, x, 0.61, x, 0.6);
+  const points = { pts: Float32Array.from(pts), count: pts.length / 2 };
+  const out = t.update([], 0, segs, points);
+  assert.deepEqual(out.matched, { left: true, right: true });
+  close(out.eY, 0, 0.02);
+  const off = new LaneTracker({ traceMinLength: 0 });
+  assert.ok(off.lock([], 0, segmentsFor(0)));
+  assert.deepEqual(off.update([], 0, segs, points).matched, { left: true, right: false });
+});
