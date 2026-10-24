@@ -21,10 +21,15 @@ export const DEFAULT_CONFIG = {
   procHeight: 320,
   hfovDeg: 53, // horizontal FOV of the frame as delivered; ~53 for the iPhone 1x camera in portrait 4:3, calibrate
   cameraHeight: 1.3, // m, chest mount
+  laneWidth: 1.22, // m between the two lines of one lane (track standard; practice lanes differ)
   whiteVMin: 180, // HSV value floor for white paint
   whiteSMax: 60, // HSV saturation ceiling (red/blue track surface is saturated)
   openKernel: 2, // morphological open removes speckle (3 would erase far lines)
-  maxLineWidthPx: 14, // top-hat: white runs wider than this (walls, white floor, lights) are not lines
+  // Top-hat: white runs wider than a line are not lines (walls, white floor, lights). The limit is
+  // in meters and converted per horizontal band, because a near line is many pixels wide and a far
+  // one only a few (a fixed 14 px erased near tape in the first phone tests).
+  maxLineWidthM: 0.15,
+  lineFilterBands: 6,
   maxPoints: 4000,
   band: { xMin: 1, xMax: 4, yHalf: 3, bin: 0.02 },
   peaks: { sigma: 0.03, minSeparation: 0.6, minFraction: 0.2, minCount: 3 },
@@ -42,7 +47,7 @@ export class GroundLineDetector {
     this.hsv = new cv.Mat();
     this.mask = new cv.Mat();
     this.kernel = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(this.cfg.openKernel, this.cfg.openKernel));
-    this.lineKernel = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(this.cfg.maxLineWidthPx, 1));
+    this.lineKernels = new Map(); // kernel width (px) -> structuring element
     this.setThresholds(this.cfg.whiteVMin, this.cfg.whiteSMax);
     this.pixels = new Float32Array(this.cfg.maxPoints * 2);
   }
@@ -66,12 +71,10 @@ export class GroundLineDetector {
     cv.cvtColor(this.rgb, this.hsv, cv.COLOR_RGB2HSV);
     cv.inRange(this.hsv, this.low, this.high, this.mask);
     cv.morphologyEx(this.mask, this.mask, cv.MORPH_OPEN, this.kernel);
-    // Keep only thin white structures: top-hat = mask minus its opening with a wide horizontal kernel.
-    // Track lines are 2-4 px wide at this resolution; wide bright areas vanish.
-    cv.morphologyEx(this.mask, this.mask, cv.MORPH_TOPHAT, this.lineKernel);
 
     const basis = upCam && groundBasis(upCam);
     if (!basis) return { ok: false, reason: upCam ? 'camera-vertical' : 'no-attitude' };
+    this.keepThinLines(basis);
 
     const count = this.collectMaskPixels();
     const ground = projectToGround(this.pixels, count, this.K, basis, cfg.cameraHeight);
@@ -89,8 +92,44 @@ export class GroundLineDetector {
       hist,
       peaks,
       segments,
-      heightEstimate: estimateHeight(peaks, cfg.cameraHeight),
+      heightEstimate: estimateHeight(peaks, cfg.cameraHeight, cfg.laneWidth),
     };
+  }
+
+  // Top-hat per horizontal band (mask minus its opening with a wide horizontal kernel): keeps white
+  // runs up to maxLineWidthM wide at that band's ground distance, removes anything wider.
+  keepThinLines(basis) {
+    const { cv, cfg, K } = this;
+    const rows = this.mask.rows;
+    const cols = this.mask.cols;
+    const bands = cfg.lineFilterBands;
+    for (let b = 0; b < bands; b++) {
+      const v0 = Math.floor((b * rows) / bands);
+      const v1 = Math.floor(((b + 1) * rows) / bands);
+      const kw = this.lineKernelWidth(basis, (v0 + v1) / 2);
+      const roi = this.mask.roi(new cv.Rect(0, v0, cols, v1 - v0));
+      cv.morphologyEx(roi, roi, cv.MORPH_TOPHAT, this.lineKernelFor(kw));
+      roi.delete();
+    }
+  }
+
+  // Kernel width (px) for a line maxLineWidthM wide at image row v, measured at the image center.
+  lineKernelWidth(basis, v) {
+    const { K, cfg } = this;
+    const g = projectToGround(Float32Array.from([K.cx, v, K.cx + 1, v]), 2, K, basis, cfg.cameraHeight, 50);
+    if (g.count < 2) return 5; // at or above the horizon: nothing here is a ground line anyway
+    const metersPerPx = Math.hypot(g.points[2] - g.points[0], g.points[3] - g.points[1]);
+    const px = Math.ceil(cfg.maxLineWidthM / metersPerPx) + 2;
+    return Math.min(81, Math.max(5, px | 1));
+  }
+
+  lineKernelFor(width) {
+    let k = this.lineKernels.get(width);
+    if (!k) {
+      k = this.cv.getStructuringElement(this.cv.MORPH_RECT, new this.cv.Size(width, 1));
+      this.lineKernels.set(width, k);
+    }
+    return k;
   }
 
   // Mask pixel coordinates, subsampled evenly when there are more than maxPoints.
@@ -114,6 +153,7 @@ export class GroundLineDetector {
   }
 
   delete() {
-    for (const m of [this.rgb, this.hsv, this.mask, this.kernel, this.lineKernel, this.low, this.high]) m.delete();
+    for (const m of [this.rgb, this.hsv, this.mask, this.kernel, this.low, this.high]) m.delete();
+    for (const k of this.lineKernels.values()) k.delete();
   }
 }

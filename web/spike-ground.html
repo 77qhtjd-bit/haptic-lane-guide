@@ -17,6 +17,7 @@
   #lock { margin-top: 8px; background: #fc3; }
   #status { font-size: 22px; font-weight: 700; margin: 8px 0; }
   #status.inside { color: #3f6; }
+  #tilt { background: #f93; color: #000; font-weight: 700; padding: 8px; border-radius: 8px; margin: 4px 0; }
   #status.outside-left, #status.outside-right, #status.lost { color: #f55; }
   #connect { margin-top: 8px; background: #39f; }
   #motors { display: flex; gap: 6px; margin: 8px 0; }
@@ -35,6 +36,7 @@
 <button id="lock" hidden>Lock lane</button>
 <button id="connect">Connect belt (BLE: LaneActuator)</button>
 <div id="status"></div>
+<div id="tilt" hidden></div>
 <div id="motors"><div>1</div><div>2</div><div>3</div><div>4</div><div>5</div></div>
 <div id="runs">
   <div class="row">
@@ -66,6 +68,7 @@
   <label>Vmin <input id="vmin" type="number" step="5" value="180"></label>
   <label>Smax <input id="smax" type="number" step="5" value="60"></label>
   <label>lag(ms) <input id="lag" type="number" step="10" value="50"></label>
+  <label>lane width(m) <input id="laneW" type="number" step="0.01" value="1.22"></label>
 </div>
 <div class="row">
   <label>manual β <input id="mbeta" type="number" step="1" value="65"></label>
@@ -276,13 +279,16 @@ function run(cv, video) {
   const tracker = new LaneTracker();
   $('lock').hidden = false;
   $('lock').onclick = () => {
-    const ok = latest?.ok && tracker.lock(latest.peaks, latest.heading);
+    tracker.cfg.laneWidth = +$('laneW').value;
+    const ok = latest?.ok && tracker.lock(latest.peaks, latest.heading, latest.segments);
     if (ok) {
       controller.zone = 0;
       estimator.reset(tracker.last.eY, tracker.last.ePsi);
       lastPredictT = performance.now();
     }
-    log(ok ? `locked: width ${(tracker.width * 100).toFixed(0)} cm` : 'lock failed: need one line on each side, ~122 cm apart');
+    log(ok
+      ? `locked: width ${(tracker.width * 100).toFixed(0)} cm`
+      : `lock failed: need a line on each side of you, ~${(+$('laneW').value * 100).toFixed(0)} cm apart, continuing over 2+ m`);
   };
 
   const frame = () => {
@@ -300,6 +306,8 @@ function run(cv, video) {
       detector = new GroundLineDetector(cv, cfg);
       detectorKey = key;
     }
+    detector.cfg.laneWidth = +$('laneW').value;
+    if (!tracker.locked) tracker.cfg.laneWidth = +$('laneW').value;
     if (cfg.whiteVMin !== detector.cfg.whiteVMin || cfg.whiteSMax !== detector.cfg.whiteSMax) {
       detector.setThresholds(cfg.whiteVMin, cfg.whiteSMax);
     }
@@ -324,6 +332,13 @@ function run(cv, video) {
       ? 'not locked'
       : `${lane.status}   eY ${(lane.eY * 100).toFixed(0)} cm   eψ ${((lane.ePsi * 180) / Math.PI).toFixed(1)}°`;
     $('status').className = lane.status;
+    // Before Lock: the lane a Lock would take now (drawn faint), or nothing if no lane is there.
+    const candidate = !tracker.locked && res.ok ? tracker.candidate(res.segments) : null;
+    if (!tracker.locked) $('status').textContent = candidate ? 'lane found - tap Lock lane' : 'no lane';
+    // Chest mount is designed for ~70 degrees; much flatter only sees the feet, steeper the horizon.
+    const beta = lastOrientation?.beta;
+    $('tilt').hidden = beta == null || (beta >= 55 && beta <= 85);
+    if (beta != null) $('tilt').textContent = `Tilt the phone to ~70° (now ${beta.toFixed(0)}°)`;
 
     // IMU stalled (or no gyro at all, e.g. a laptop webcam): keep the filter moving from here.
     const imuAgeMs = performance.now() - lastMotionT;
@@ -369,8 +384,9 @@ function run(cv, video) {
     fps = 0.9 * fps + 0.1 * (1000 / (now - lastT));
     lastT = now;
 
-    drawView(vctx, img, detector, res, lane);
-    drawBev($('bev'), res, lane);
+    const shown = tracker.locked ? lane : candidate && candidateLane(candidate, res.heading);
+    drawView(vctx, img, detector, res, shown, cueText(cmd, tracker.locked, !!candidate));
+    drawBev($('bev'), res, shown);
     drawHist($('hist'), res);
 
     let left = null;
@@ -424,33 +440,63 @@ const alongLane = (t, y, heading) => [
   t * Math.sin(heading) + y * Math.cos(heading),
 ];
 
-// Locked lane painted green (like fillConvexPoly + addWeighted in the reference), centerline in yellow.
-function drawLockedLane(ctx, toScreen, lane) {
-  if (lane.status === LaneStatus.UNLOCKED || lane.status === LaneStatus.LOST) return;
-  const ts = [];
-  for (let t = 1; t <= 5.5; t += 0.25) ts.push(t);
-  const { b = 0, c = 0 } = lane.shape ?? {};
-  // Fitted lane shape in the aligned frame: y(x) = center + b·x + c·x² (+ offset for each line).
-  const edge = (offset) =>
-    ts.map((t) => toScreen(...alongLane(t, offset + b * t + c * t * t, lane.heading))).filter(Boolean);
-  const left = edge(lane.leftY);
-  const right = edge(lane.rightY).reverse();
-  if (left.length > 1 && right.length > 1) {
-    ctx.fillStyle = lane.status === LaneStatus.INSIDE ? 'rgba(0, 230, 30, 0.3)' : 'rgba(255, 60, 60, 0.3)';
+// A Lock preview in the same shape the tracker outputs, for drawing.
+function candidateLane(cand, heading) {
+  return { status: 'candidate', heading, width: cand.width, polylines: cand.polylines };
+}
+
+// Big text over the camera view, like the reference's "Straight".
+function cueText(cmd, locked, found) {
+  if (!locked) return found ? 'LANE FOUND' : 'NO LANE';
+  if (cmd.pattern === Pattern.STOP) return 'STOP';
+  if (cmd.pattern === Pattern.HEARTBEAT) return 'STRAIGHT';
+  if (cmd.pattern === Pattern.STEER) return cmd.motors & 0b00011 ? '◀ LEFT' : 'RIGHT ▶';
+  return '';
+}
+
+// The lane as found segment by segment: each line is the chain of points the sliding window
+// matched (joined short straight pieces), and the space between the two lines is filled, as in
+// the ideal case. A side with no chain is drawn one lane width from the other side.
+function drawLane(ctx, toScreen, lane) {
+  if (!lane || !lane.polylines) return;
+  let { left, right } = lane.polylines;
+  if (!left.length && !right.length) return;
+  if (!left.length) left = right.map((p) => ({ x: p.x, y: p.y - lane.width }));
+  if (!right.length) right = left.map((p) => ({ x: p.x, y: p.y + lane.width }));
+  // Reach toward the runner's feet and a little past the last segment, along each line's own end
+  // direction, so the fill covers the whole lane in view like the ideal case.
+  const extend = (chain) => {
+    if (chain.length < 2) return chain;
+    const [a0, a1] = chain;
+    const [z1, z0] = chain.slice(-2);
+    const s0 = (a1.y - a0.y) / (a1.x - a0.x);
+    const s1 = (z0.y - z1.y) / (z0.x - z1.x);
+    return [{ x: 0.5, y: a0.y - s0 * (a0.x - 0.5) }, ...chain, { x: z0.x + 0.5, y: z0.y + s1 * 0.5 }];
+  };
+  const toPts = (chain) => extend(chain).map((p) => toScreen(...alongLane(p.x, p.y, lane.heading))).filter(Boolean);
+  const l = toPts(left);
+  const r = toPts(right);
+  const preview = lane.status === 'candidate';
+  const outside = lane.status === LaneStatus.OUTSIDE_LEFT || lane.status === LaneStatus.OUTSIDE_RIGHT;
+  if (l.length && r.length) {
+    ctx.fillStyle = preview ? 'rgba(0, 230, 30, 0.15)' : outside ? 'rgba(255, 60, 60, 0.35)' : 'rgba(0, 230, 30, 0.35)';
     ctx.beginPath();
-    [...left, ...right].forEach(([x, y], i) => (i ? ctx.lineTo(x, y) : ctx.moveTo(x, y)));
+    [...l, ...[...r].reverse()].forEach(([x, y], i) => (i ? ctx.lineTo(x, y) : ctx.moveTo(x, y)));
     ctx.closePath();
     ctx.fill();
   }
-  const center = edge(lane.center);
-  ctx.strokeStyle = '#fc3';
-  ctx.lineWidth = 3;
-  ctx.beginPath();
-  center.forEach(([x, y], i) => (i ? ctx.lineTo(x, y) : ctx.moveTo(x, y)));
-  ctx.stroke();
+  ctx.strokeStyle = '#ff3';
+  ctx.lineWidth = preview ? 2 : 5;
+  ctx.setLineDash(preview ? [6, 6] : []);
+  for (const pts of [l, r]) {
+    ctx.beginPath();
+    pts.forEach(([x, y], i) => (i ? ctx.lineTo(x, y) : ctx.moveTo(x, y)));
+    ctx.stroke();
+  }
+  ctx.setLineDash([]);
 }
 
-function drawView(ctx, img, detector, res, lane) {
+function drawView(ctx, img, detector, res, lane, cue) {
   const s = 2;
   const tmp = new OffscreenCanvas(img.width, img.height);
   const tctx = tmp.getContext('2d');
@@ -465,30 +511,25 @@ function drawView(ctx, img, detector, res, lane) {
   tctx.putImageData(img, 0, 0);
   ctx.imageSmoothingEnabled = false;
   ctx.drawImage(tmp, 0, 0, img.width * s, img.height * s);
-  if (!res.ok) return;
-  drawLockedLane(ctx, (x, y) => {
-    const px = groundToPixel(x, y, detector.K, res.basis, detector.cfg.cameraHeight);
-    return px && [px[0] * s, px[1] * s];
-  }, lane);
-  ctx.strokeStyle = '#3f6';
-  ctx.lineWidth = 2;
-  const c = Math.cos(res.heading);
-  const sn = Math.sin(res.heading);
-  for (const p of res.peaks) {
-    ctx.beginPath();
-    let started = false;
-    for (let t = 1; t <= 6; t += 0.25) {
-      const px = groundToPixel(t * c - p.y * sn, t * sn + p.y * c, detector.K, res.basis, detector.cfg.cameraHeight);
-      if (!px) continue;
-      if (started) ctx.lineTo(px[0] * s, px[1] * s);
-      else ctx.moveTo(px[0] * s, px[1] * s);
-      started = true;
-    }
-    ctx.stroke();
+  if (res.ok) {
+    drawLane(ctx, (x, y) => {
+      const px = groundToPixel(x, y, detector.K, res.basis, detector.cfg.cameraHeight);
+      return px && [px[0] * s, px[1] * s];
+    }, lane);
+  }
+  if (cue) {
+    ctx.font = `bold ${Math.round(ctx.canvas.width / 9)}px -apple-system, system-ui, sans-serif`;
+    ctx.textAlign = 'center';
+    ctx.lineWidth = 6;
+    ctx.strokeStyle = 'rgba(0, 0, 0, 0.6)';
+    ctx.fillStyle = cue === 'STOP' || cue === 'NO LANE' ? '#f55' : '#fff';
+    ctx.strokeText(cue, ctx.canvas.width / 2, ctx.canvas.height * 0.12);
+    ctx.fillText(cue, ctx.canvas.width / 2, ctx.canvas.height * 0.12);
   }
 }
 
-// Bird's-eye view: forward 0..5m bottom to top, lateral -3..3m.
+// Bird's-eye view: forward 0..5m bottom to top, lateral -3..3m. Red dots: line pixels on the
+// ground; white ticks: line peaks found per segment; the lane as in drawLane.
 function drawBev(canvas, res, lane) {
   const ctx = canvas.getContext('2d');
   const W = canvas.width;
@@ -503,20 +544,22 @@ function drawBev(canvas, res, lane) {
   ctx.beginPath();
   ctx.arc(sx(0), sy(0) - 4, 4, 0, 2 * Math.PI);
   ctx.fill();
-  drawLockedLane(ctx, (x, y) => [sx(y), sy(x)], lane);
+  drawLane(ctx, (x, y) => [sx(y), sy(x)], lane);
   if (!res.ok) return;
   ctx.fillStyle = '#f55';
   const { points, count } = res.ground;
   for (let i = 0; i < count; i++) ctx.fillRect(sx(points[2 * i + 1]), sy(points[2 * i]), 1.5, 1.5);
-  ctx.strokeStyle = '#3f6';
-  const c = Math.cos(res.heading);
-  const sn = Math.sin(res.heading);
-  for (const p of res.peaks) {
-    ctx.beginPath();
-    // Line at perpendicular offset p.y along heading: (x, y) = (t·cos − y'·sin, t·sin + y'·cos).
-    ctx.moveTo(sx(p.y * c), sy(-p.y * sn));
-    ctx.lineTo(sx(6 * sn + p.y * c), sy(6 * c - p.y * sn));
-    ctx.stroke();
+  ctx.strokeStyle = '#fff';
+  ctx.lineWidth = 2;
+  for (const seg of res.segments) {
+    for (const p of seg.peaks) {
+      const [x0, y0] = alongLane(seg.x - 0.15, p.y, res.heading);
+      const [x1, y1] = alongLane(seg.x + 0.15, p.y, res.heading);
+      ctx.beginPath();
+      ctx.moveTo(sx(y0), sy(x0));
+      ctx.lineTo(sx(y1), sy(x1));
+      ctx.stroke();
+    }
   }
 }
 

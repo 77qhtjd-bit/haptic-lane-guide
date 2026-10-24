@@ -6,6 +6,11 @@
 // predicted to be, so a neighbor lane's line is never picked up, and a runner who crosses a line
 // is reported as outside the lane instead of being silently re-locked onto the next one.
 //
+// Finding the lines (sliding window, as in driving lane detection): start in the segment nearest the
+// runner with the line just left and just right of the runner, then search each farther segment
+// only where that line is heading. A line must continue over at least two segments, so short
+// white things (a chair leg, a shoe, a reflection) never count as a lane line.
+//
 // Lane model, in the heading-aligned ground frame of GroundLineDetector (x forward, y right, the
 // runner at the origin): both lines are parallel curves
 //   y(x) = a + b·x + c·x² ∓ width/2        (L: minus, R: plus)
@@ -25,6 +30,7 @@ export const DEFAULT_TRACKER_CONFIG = {
   lockWidthTolerance: 0.25, // fraction of laneWidth allowed between L and R at lock time
   gate: 0.25, // m: max distance between a predicted line and the peak it is matched to
   gateGrowthPerFrame: 0.01, // m: the gate widens while coasting, capped below half a lane
+  segmentGate: 0.12, // m: from one segment to the next, the line may deviate this much from its course
   alpha: 0.5, // alpha-beta filter on the lane offset a (the Kalman filter smooths further)
   beta: 0.1,
   shapeAlpha: 0.4, // smoothing of slope b and curve c
@@ -56,11 +62,73 @@ export class LaneTracker {
     this.width = this.cfg.laneWidth;
     this.heading = 0; // rotation of the aligned frame (from the detector's heading search)
     this.missed = 0;
+    this.polylines = { left: [], right: [] };
     this.last = { status: LaneStatus.UNLOCKED };
   }
 
-  // Locks onto the nearest line on each side of the runner. Returns true on success.
-  lock(peaks, heading) {
+  // The lane a Lock would take right now, or null: in the nearest segment that shows a line on each
+  // side of the runner about one lane width apart, follow both lines outward (sliding window).
+  // Used to preview the lane before locking and by lock() itself.
+  candidate(segments) {
+    const { laneWidth, lockWidthTolerance, segmentGate } = this.cfg;
+    const minChain = segments.length > 1 ? 2 : 1;
+    for (const seg of segments) {
+      // Per side, the nearest peak that continues as a line. The second nearest is only considered
+      // when the nearest does not continue (a white thing between runner and line); otherwise a
+      // narrow lane could be locked as two lanes at once.
+      const sideOptions = (peaks) => {
+        const out = [];
+        for (const p of byDistance(peaks).slice(0, 2)) {
+          const chain = followLine(segments, p.y, 0, 0, segmentGate, segmentGate);
+          if (chain.length < minChain) continue;
+          out.push({ p, chain });
+          // A clean, straight line (3+ segments, no hop): no need to look past it.
+          if (chain.length >= Math.min(3, segments.length) && chainRms(chain) < 0.02) break;
+        }
+        return out;
+      };
+      const lefts = sideOptions(seg.peaks.filter((p) => p.y < 0));
+      const rights = sideOptions(seg.peaks.filter((p) => p.y >= 0));
+      let best = null;
+      for (const { p: left, chain: leftChain } of lefts) {
+        for (const { p: right, chain: rightChain } of rights) {
+          const width = right.y - left.y;
+          if (Math.abs(width - laneWidth) > lockWidthTolerance * laneWidth) continue;
+          // Longer and straighter wins: a chain that started on junk and hopped onto the real line
+          // bends where it hopped.
+          const score = leftChain.length + rightChain.length - (chainRms(leftChain) + chainRms(rightChain)) / 0.02;
+          if (!best || score > best.score) best = { score, width, leftChain, rightChain };
+        }
+      }
+      if (!best) continue;
+      const { width, leftChain, rightChain } = best;
+      const obs = [
+        ...leftChain.map((p) => ({ x: p.x, y: p.y + width / 2 })),
+        ...rightChain.map((p) => ({ x: p.x, y: p.y - width / 2 })),
+      ];
+      const fit = fitCenterline(obs, 0);
+      return { center: fit.a, slope: fit.hasB ? fit.b : 0, curve: fit.c, width, polylines: { left: leftChain, right: rightChain } };
+    }
+    return null;
+  }
+
+  // Locks onto the line just left and just right of the runner. With segments, both lines must
+  // continue outward (see candidate()). Returns true on success.
+  lock(peaks, heading, segments = null) {
+    if (segments && segments.length) {
+      const cand = this.candidate(segments);
+      if (!cand) return false;
+      this.reset();
+      this.locked = true;
+      this.center = cand.center;
+      this.slope = cand.slope;
+      this.curve = cand.curve;
+      this.width = cand.width;
+      this.heading = heading;
+      this.polylines = cand.polylines;
+      this.last = this.output({ left: true, right: true }, 1);
+      return true;
+    }
     const { laneWidth, lockWidthTolerance } = this.cfg;
     const left = nearest(peaks.filter((p) => p.y < 0), 0);
     const right = nearest(peaks.filter((p) => p.y >= 0), 0);
@@ -82,33 +150,34 @@ export class LaneTracker {
     if (!this.locked) return this.last;
     if (this.last.status === LaneStatus.LOST) return this.last;
 
-    const { gate, gateGrowthPerFrame, alpha, beta, shapeAlpha, maxCurvature, widthAlpha, coastFrames } = this.cfg;
+    const { gate, gateGrowthPerFrame, segmentGate, alpha, beta, shapeAlpha, maxCurvature, widthAlpha, coastFrames } = this.cfg;
     // Re-express the previous slope in this frame's rotation.
     const slope = Math.tan(Math.atan(this.slope) + this.heading - heading);
     const predicted = this.center + this.centerRate;
     const half = this.width / 2;
     const g = Math.min(gate + this.missed * gateGrowthPerFrame, 0.45 * this.width);
-    const curveAt = (x) => predicted + slope * x + this.curve * x * x;
 
-    // Gated association per segment; legacy callers pass one band of peaks taken as x = 0.
+    // Sliding window per line, starting where last frame's lane puts it; legacy callers pass one
+    // band of peaks taken as a single segment at x = 0.
     const segs = segments ?? [{ x: 0, peaks }];
-    const obs = []; // { x, y (centerline-equivalent), side }
-    const matched = { left: false, right: false };
+    const minChain = segs.length > 1 ? 2 : 1;
+    const follow = (startY) => {
+      const chain = followLine(segs, startY, slope, this.curve, g, segmentGate);
+      return chain.length >= minChain ? chain : [];
+    };
+    const leftChain = follow(predicted - half);
+    const rightChain = follow(predicted + half);
+    const matched = { left: leftChain.length > 0, right: rightChain.length > 0 };
+    const obs = [
+      ...leftChain.map((p) => ({ x: p.x, y: p.y + half })),
+      ...rightChain.map((p) => ({ x: p.x, y: p.y - half })),
+    ];
     const widths = [];
-    for (const seg of segs) {
-      const mid = curveAt(seg.x);
-      const left = nearestWithin(seg.peaks, mid - half, g);
-      const right = nearestWithin(seg.peaks, mid + half, g);
-      if (left) {
-        obs.push({ x: seg.x, y: left.y + half });
-        matched.left = true;
-      }
-      if (right) {
-        obs.push({ x: seg.x, y: right.y - half });
-        matched.right = true;
-      }
-      if (left && right && right.y - left.y > 0.5 * this.width) widths.push(right.y - left.y);
+    for (const l of leftChain) {
+      const r = rightChain.find((p) => p.x === l.x);
+      if (r && r.y - l.y > 0.5 * this.width) widths.push(r.y - l.y);
     }
+    this.polylines = { left: leftChain, right: rightChain };
 
     if (obs.length === 0) {
       this.center = predicted;
@@ -163,6 +232,7 @@ export class LaneTracker {
       width: this.width,
       heading: this.heading,
       shape: { a: this.center, b: this.slope, c: this.curve }, // y(x) in the aligned frame
+      polylines: this.polylines, // matched line points per segment, aligned frame
       matched: { left: !!matched.left, right: !!matched.right },
       confidence,
     };
@@ -217,6 +287,39 @@ function solveLeastSquares(obs, basis) {
   }
   return out;
 }
+
+// Follows one line through the segments from near to far. The first match is searched at startY
+// (+ the lane's course) within firstGate; each later one where the line seen so far is heading,
+// within segmentGate. One missing segment is tolerated; two end the line.
+function followLine(segs, startY, slope, curve, firstGate, segmentGate) {
+  const chain = [];
+  let lastX = 0;
+  let lastY = startY;
+  let dir = slope;
+  let misses = 0;
+  for (const seg of segs) {
+    const expect = lastY + dir * (seg.x - lastX) + curve * (seg.x * seg.x - lastX * lastX);
+    const p = nearestWithin(seg.peaks, expect, chain.length ? segmentGate : firstGate);
+    if (!p) {
+      if (chain.length && ++misses > 1) break;
+      continue;
+    }
+    if (chain.length) dir = (p.y - lastY - curve * (seg.x * seg.x - lastX * lastX)) / (seg.x - lastX);
+    chain.push({ x: seg.x, y: p.y });
+    lastX = seg.x;
+    lastY = p.y;
+  }
+  return chain;
+}
+
+// RMS distance of a chain's points from their own best-fit line (0 for 2 points or fewer).
+function chainRms(chain) {
+  if (chain.length < 3) return 0;
+  const [a, b] = solveLeastSquares(chain, (x) => [1, x]);
+  return Math.sqrt(chain.reduce((acc, p) => acc + (p.y - a - b * p.x) ** 2, 0) / chain.length);
+}
+
+const byDistance = (peaks) => [...peaks].sort((p, q) => Math.abs(p.y) - Math.abs(q.y));
 
 function nearest(peaks, y) {
   let best = null;
