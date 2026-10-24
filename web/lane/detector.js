@@ -88,6 +88,7 @@ export class GroundLineDetector {
       basis,
       maskPixels: count,
       ground,
+      aligned, // ground points rotated into the lane-aligned frame (flat [x0, y0, ...], ground.count)
       heading,
       hist,
       peaks,

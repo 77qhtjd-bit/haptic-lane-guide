@@ -243,7 +243,7 @@ function processFrame(mediaTime) {
   const res = detector.process(rgba, up, prevHeading);
   rgba.delete();
   latest = res;
-  let lane = tracker.update(res.ok ? res.peaks : [], res.ok ? res.heading : tracker.heading, res.ok ? res.segments : []);
+  let lane = tracker.update(res.ok ? res.peaks : [], res.ok ? res.heading : tracker.heading, res.ok ? res.segments : [], res.ok ? { pts: res.aligned, count: res.ground.count } : null);
   if (tracker.locked && lane.status !== LaneStatus.LOST) prevHeading = lane.heading;
   else prevHeading = res.ok && res.peaks.length ? res.heading : 0;
 

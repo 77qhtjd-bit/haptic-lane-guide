@@ -68,6 +68,14 @@ export const DEFAULT_TRACKER_CONFIG = {
   // has persisted jumpFrames frames: a runner does not teleport, a neighbor/diagonal line does.
   jumpGuard: 0.3,
   jumpFrames: 6,
+  // Line check with the ground points (needs update(..., points)): around each matched peak, the
+  // white points within verifyBand of the line over ±verifyHalfLen must run along the lane; a fitted
+  // direction off the lane's course by more than verifySlope (tan 15°) is a crossing line (staggered
+  // start lines, painted marks, a shadow edge), and that peak is dropped from the chain.
+  verifySlope: 0.27,
+  verifyHalfLen: 0.4,
+  verifyBand: 0.1,
+  verifyMinPoints: 8,
 };
 
 export const LaneStatus = Object.freeze({
@@ -223,7 +231,8 @@ export class LaneTracker {
 
   // peaks: detector peaks over the whole band (used when segments are not given: straight model).
   // segments: detector segments [{ x, peaks }] for the curved model.
-  update(peaks, heading, segments = null) {
+  // points (optional): { pts, count }, the detector's lane-aligned ground points, for verifySlope.
+  update(peaks, heading, segments = null, points = null) {
     if (!this.locked) return this.last;
     if (this.last.status === LaneStatus.LOST) return this.last;
 
@@ -244,6 +253,10 @@ export class LaneTracker {
     };
     let leftChain = follow(predicted - half);
     let rightChain = follow(predicted + half);
+    if (this.cfg.verifySlope > 0 && points && points.count) {
+      leftChain = this.verifyChain(leftChain, points, slope, minChain);
+      rightChain = this.verifyChain(rightChain, points, slope, minChain);
+    }
     if (this.settle > 0) this.settle--;
     // Spacing check: drop the side that disagrees with the prediction when the two lines are not a
     // lane width apart (one of them is a neighbor line, a diagonal or a shadow edge).
@@ -313,6 +326,28 @@ export class LaneTracker {
     const confidence = matched.left && matched.right ? 1 : segmentsSeen >= 2 ? 0.7 : 0.6;
     this.last = this.debounced(this.output(matched, confidence), true);
     return this.last;
+  }
+
+  // Drops chain points whose local white points do not run along the lane (see verifySlope).
+  verifyChain(chain, { pts, count }, laneSlope, minChain) {
+    if (!chain.length) return chain;
+    const { verifySlope, verifyHalfLen, verifyBand, verifyMinPoints } = this.cfg;
+    const kept = chain.filter((c) => {
+      let n = 0, sx = 0, sy = 0, sxx = 0, sxy = 0;
+      for (let i = 0; i < count; i++) {
+        const x = pts[2 * i], y = pts[2 * i + 1];
+        if (Math.abs(x - c.x) > verifyHalfLen) continue;
+        // Band around the line on the lane's course through this point.
+        if (Math.abs(y - (c.y + laneSlope * (x - c.x))) > verifyBand) continue;
+        n++; sx += x; sy += y; sxx += x * x; sxy += x * y;
+      }
+      if (n < verifyMinPoints) return true; // too few points to judge: keep
+      const den = n * sxx - sx * sx;
+      if (den <= 1e-9) return true;
+      const b = (n * sxy - sx * sy) / den;
+      return Math.abs(b - laneSlope) <= verifySlope;
+    });
+    return kept.length >= minChain ? kept : [];
   }
 
   // Applies the inside/outside debounce to an output. observed: at least one line matched this frame.
