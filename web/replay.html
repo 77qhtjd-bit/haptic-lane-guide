@@ -64,7 +64,7 @@ import { HapticController } from './control/controller.js';
 import { commandToLevels } from './control/protocol.js';
 import { candidateLane, cueText, drawView, drawBev } from './lane/draw.js';
 
-const PAGE_VERSION = "replay-3";
+const PAGE_VERSION = "replay-4";
 const $ = (id) => document.getElementById(id);
 const log = (msg) => { $('log').textContent = `${msg}\n` + $('log').textContent; };
 window.addEventListener('error', (e) => log(`error: ${e.message}`));
@@ -105,10 +105,13 @@ let lockEvents = 0, lostEvents = 0, prevStatus = LaneStatus.UNLOCKED, lostSince 
 // Tracker settings for experiments: ?t_gate=0.35&t_segmentGate=0.2&t_coastFrames=45 ... (any DEFAULT_TRACKER_CONFIG key).
 const trackerOverrides = {};
 for (const [k, v] of new URLSearchParams(location.search)) if (k.startsWith('t_')) trackerOverrides[k.slice(2)] = +v;
+// Haptic controller settings likewise: ?c_deadband=0.2&c_strong=0.4 (any DEFAULT_CONTROL_CONFIG key).
+const controlOverrides = {};
+for (const [k, v] of new URLSearchParams(location.search)) if (k.startsWith('c_')) controlOverrides[k.slice(2)] = +v;
 function resetPipeline() {
   tracker = new LaneTracker(trackerOverrides);
   estimator = new LaneEstimator();
-  controller = new HapticController();
+  controller = new HapticController(controlOverrides);
   attitude = new AttitudeBuffer();
   oi = mi = 0;
   upDevice = null; lastOrientation = null; lastMotionT = -Infinity; lastPredictT = null; yawRate = 0;
@@ -273,6 +276,7 @@ function processFrame(mediaTime) {
     matched: tracker.locked && lane.matched ? `${lane.matched.left ? 'L' : ''}${lane.matched.right ? 'R' : ''}` : '',
     u_m: cmd.u, zone: cmd.zone, cue: cue.replace(/[◀▶]/g, '').trim(),
     L1: levels[0], L2: levels[1], L3: levels[2], L4: levels[3], L5: levels[4],
+    motor_cue: motorCue(levels),
     imu_age_ms: Number.isFinite(imuAgeMs) ? Math.round(imuAgeMs) : '',
     beta: lastOrientation?.beta ?? '', gamma: lastOrientation?.gamma ?? '',
     height_est_m: res.heightEstimate ?? '', mask_px: res.maskPixels ?? '', proc_ms: +procMs.toFixed(2),
@@ -303,6 +307,38 @@ function processFrame(mediaTime) {
   ].join('\n');
 }
 
+// Which belt cue a frame gives: M1/M2 left (big/small), M3 heartbeat, M4/M5 right, STOP (M1+M5), OFF.
+function motorCue(levels) {
+  if (levels[0] && levels[4]) return 'STOP';
+  const i = levels.findIndex((v) => v > 0);
+  return i < 0 ? 'OFF' : `M${i + 1}`;
+}
+const cueSide = (c) => (c === 'M1' || c === 'M2' ? 'L' : c === 'M4' || c === 'M5' ? 'R' : c);
+
+// Cue behavior over a set of consecutive frame rows: share of time per cue, changes per minute,
+// direct left<->right reversals, and cue episodes shorter than 0.5 s (chatter).
+function cueStats(rs) {
+  if (rs.length < 2) return null;
+  const share = {};
+  for (const r of rs) share[r.motor_cue] = (share[r.motor_cue] || 0) + 100 / rs.length;
+  let changes = 0, reversals = 0, short = 0, episodeStart = rs[0].t_s, minutes = 0;
+  for (let i = 1; i < rs.length; i++) {
+    const dt = rs[i].t_s - rs[i - 1].t_s;
+    if (dt > 0.5) { episodeStart = rs[i].t_s; continue; }   // gap between scored stretches
+    minutes += dt / 60;
+    if (rs[i].motor_cue !== rs[i - 1].motor_cue) {
+      changes++;
+      const a = cueSide(rs[i - 1].motor_cue), b = cueSide(rs[i].motor_cue);
+      if ((a === 'L' && b === 'R') || (a === 'R' && b === 'L')) reversals++;
+      if (rs[i].t_s - episodeStart < 0.5) short++;
+      episodeStart = rs[i].t_s;
+    }
+  }
+  for (const k in share) share[k] = +share[k].toFixed(1);
+  return { share_pct: share, changes_per_min: +(changes / minutes).toFixed(1),
+           lr_reversals_per_min: +(reversals / minutes).toFixed(1), short_episodes_per_min: +(short / minutes).toFixed(1) };
+}
+
 // ---------- Summary ----------
 const median = (a) => { if (!a.length) return NaN; const s = [...a].sort((x, y) => x - y); return s[s.length >> 1]; };
 const pct = (a, p) => { if (!a.length) return NaN; const s = [...a].sort((x, y) => x - y); return s[Math.min(s.length - 1, Math.floor(p * s.length))]; };
@@ -327,6 +363,13 @@ function scoreTruth() {
     inside_line_seen_pct: share(inF, (r) => r.matched !== ''),
     out_truth_frames: outF.length,
     out_detected_pct: share(outF, outside),
+    // Belt behavior while the runner was really inside: ideally mostly M3 (heartbeat), few changes.
+    inside_cues: cueStats(inF),
+    // For each real departure: seconds from its start until the belt first gives a steering or STOP cue.
+    out_warning_delay_s: truthOut.map(([a, b]) => {
+      const r = rows.find((x) => x.t_s >= a && x.t_s <= b + 1 && x.motor_cue !== 'M3' && x.motor_cue !== 'OFF');
+      return r ? +(r.t_s - a).toFixed(2) : null;
+    }),
   };
 }
 function summarize() {
@@ -347,7 +390,7 @@ function summarize() {
   for (const r of rows) if (r.reason) reasons[r.reason] = (reasons[r.reason] || 0) + 1;
   return {
     page_version: PAGE_VERSION, clip: rec?.name, memo: rec?.memo,
-    settings: { tracker: trackerOverrides, h: +$('h').value, hfov: +$('hfov').value, vmin: +$('vmin').value, smax: +$('smax').value,
+    settings: { tracker: trackerOverrides, control: controlOverrides, h: +$('h').value, hfov: +$('hfov').value, vmin: +$('vmin').value, smax: +$('smax').value,
                 lag_ms: +$('lag').value, lane_min: +$('laneMin').value, lane_max: +$('laneMax').value, autolock: $('autolock').checked },
     frames_processed: n, frames_in_clip: rec?.frames?.length ?? null,
     locked_pct: n ? (100 * locked.length) / n : 0,
