@@ -358,6 +358,7 @@ function run(cv, video) {
     belt.send(condition === Condition.BELT ? levels : [0, 0, 0, 0, 0]);
     audioCue.update(cmd, condition === Condition.AUDIO);
     showMotors(cmd, levels);
+    const cue = cueText(cmd, tracker.locked, !!candidate);
     logger.record({
       status: lane.status,
       confidence: lane.confidence ?? 0,
@@ -367,8 +368,11 @@ function run(cv, video) {
       eY_kf_m: state.eY,
       vY_kf_mps: state.vY,
       ePsi_kf_rad: state.ePsi,
+      lane_width_m: tracker.locked ? lane.width : '',
+      matched: tracker.locked ? `${lane.matched.left ? 'L' : ''}${lane.matched.right ? 'R' : ''}` : '',
       u_m: cmd.u,
       zone: cmd.zone,
+      cue: cue.replace(/[◀▶]/g, '').trim(), // plain ASCII so spreadsheets open the CSV cleanly
       motors: cmd.motors,
       period_ms: cmd.periodMs,
       L1: levels[0],
@@ -386,7 +390,7 @@ function run(cv, video) {
     lastT = now;
 
     const shown = tracker.locked ? lane : candidate && candidateLane(candidate, res.heading);
-    drawView(vctx, img, detector, res, shown, cueText(cmd, tracker.locked, !!candidate));
+    drawView(vctx, img, detector, res, shown, cue);
     drawBev($('bev'), res, shown);
     drawHist($('hist'), res);
 
@@ -495,6 +499,43 @@ function drawLane(ctx, toScreen, lane) {
     ctx.stroke();
   }
   ctx.setLineDash([]);
+
+  // The reference line the PD controller follows: the fitted centerline (eY and eψ are measured
+  // against it at the runner). Before Lock, the middle of the two found lines.
+  const xs = [];
+  for (let x = 0.5; x <= Math.max(...left.map((p) => p.x), ...right.map((p) => p.x)) + 0.5; x += 0.25) xs.push(x);
+  const { shape } = lane;
+  const centerY = shape
+    ? (x) => shape.a + shape.b * x + shape.c * x * x
+    : (x) => (interp(left, x) + interp(right, x)) / 2;
+  const center = xs.map((x) => toScreen(...alongLane(x, centerY(x), lane.heading))).filter(Boolean);
+  ctx.strokeStyle = '#fff';
+  ctx.lineWidth = preview ? 2 : 3;
+  ctx.setLineDash([10, 8]);
+  ctx.beginPath();
+  center.forEach(([x, y], i) => (i ? ctx.lineTo(x, y) : ctx.moveTo(x, y)));
+  ctx.stroke();
+  ctx.setLineDash([]);
+  if (preview) return;
+
+  // The runner's own straight-ahead path (camera ground frame, y = 0). Its gap to the centerline is
+  // the error the belt is correcting.
+  const path = [0.3, 1, 2, 3].map((x) => toScreen(x, 0)).filter(Boolean);
+  ctx.strokeStyle = '#3cf';
+  ctx.lineWidth = 3;
+  ctx.beginPath();
+  path.forEach(([x, y], i) => (i ? ctx.lineTo(x, y) : ctx.moveTo(x, y)));
+  ctx.stroke();
+}
+
+// Linear interpolation / end extrapolation of a chain's y at distance x.
+function interp(chain, x) {
+  if (chain.length === 1) return chain[0].y;
+  let i = 1;
+  while (i < chain.length - 1 && chain[i].x < x) i++;
+  const a = chain[i - 1];
+  const b = chain[i];
+  return a.y + ((b.y - a.y) * (x - a.x)) / (b.x - a.x);
 }
 
 function drawView(ctx, img, detector, res, lane, cue) {
