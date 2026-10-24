@@ -180,10 +180,23 @@ $('runBtn').onclick = () => {
     $('condition').disabled = true;
   }
 };
-// Downloads may be blocked inside some iOS browsers, so copy and show are there as fallbacks.
-$('csvDownload').onclick = () => {
-  const url = URL.createObjectURL(new Blob([logger.toCsv()], { type: 'text/csv' }));
-  const a = Object.assign(document.createElement('a'), { href: url, download: `lane-runs-${Date.now()}.csv` });
+// Bluefy blocks download links; the iOS share sheet ("Save to Files") works there, as in
+// record.html. Download links remain the fallback for browsers without file sharing.
+$('csvDownload').textContent = 'Save CSV';
+$('csvDownload').onclick = async () => {
+  const name = `lane-runs-${new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14)}.csv`;
+  const file = new File([logger.toCsv()], name, { type: 'text/csv' });
+  if (navigator.canShare && navigator.canShare({ files: [file] })) {
+    try {
+      await navigator.share({ files: [file], title: name });
+      log(`CSV shared: ${name}`);
+    } catch (err) {
+      if (err.name !== 'AbortError') log(`share failed (${err.name} ${err.message}); use Copy CSV or Show CSV`);
+    }
+    return;
+  }
+  const url = URL.createObjectURL(file);
+  const a = Object.assign(document.createElement('a'), { href: url, download: name });
   document.body.append(a);
   a.click();
   a.remove();
