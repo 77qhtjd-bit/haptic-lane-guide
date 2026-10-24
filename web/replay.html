@@ -205,6 +205,8 @@ function tryLock() {
     controller.zone = 0;
     estimator.reset(tracker.last.eY, tracker.last.ePsi);
     lockEvents++;
+    const pl = tracker.polylines;
+    log(`lock #${lockEvents} at ${rows.length ? rows[rows.length - 1].t_s.toFixed(2) : '0'} s: L ${pl.left[0]?.y.toFixed(2) ?? '-'} R ${pl.right[0]?.y.toFixed(2) ?? '-'} width ${tracker.width.toFixed(2)}`);
   }
   return ok;
 }
@@ -263,7 +265,7 @@ function processFrame(mediaTime) {
     estimator.update(lane.eY, lane.ePsi, lane.confidence * (attitudeAgeMs > IMU_STALE_MS ? 0.4 : 1));
   }
   const state = estimator.initialized ? estimator.state : { eY: lane.eY ?? 0, vY: 0, ePsi: lane.ePsi ?? 0 };
-  const cmd = controller.step(state, lane.status, lane.curvature ?? 0, T);
+  const cmd = controller.step(state, lane.status, lane.curvature ?? 0, T, !!lane.lowConfidence);
   const levels = commandToLevels(cmd);
   const procMs = performance.now() - t0;
   const cue = cueText(cmd, tracker.locked, !!candidate);

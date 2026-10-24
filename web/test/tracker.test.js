@@ -207,3 +207,52 @@ test('inside/outside changes only after statusFrames observed frames, not on coa
   const empty = crossed.map((s) => ({ ...s, peaks: [] }));
   for (let i = 0; i < 10; i++) assert.equal(t.update([], 0, empty).status, LaneStatus.INSIDE);
 });
+
+// Detector segments of the jogging clip at 119.99 s (h 1.5 m): the runner's lane lines at
+// -0.73 / +0.57 m, the next lane's right line at +1.75..1.81 m and a line two lanes left.
+const JOG_119_99 = [
+  { x: 1.4, peaks: [{ y: -0.73, strength: 50 }, { y: 0.57, strength: 50 }] },
+  { x: 2.4, peaks: [{ y: -0.72, strength: 50 }, { y: 0.55, strength: 50 }] },
+  { x: 3.5, peaks: [{ y: -0.72, strength: 50 }, { y: 0.53, strength: 50 }, { y: 1.81, strength: 50 }] },
+  { x: 4.6, peaks: [{ y: -1.99, strength: 50 }, { y: -0.75, strength: 50 }, { y: 0.47, strength: 50 }, { y: 1.75, strength: 50 }] },
+];
+
+test('re-lock on the jogging 119.99 s frame takes the pair around the runner, not the lane to the right', () => {
+  const t = new LaneTracker({ minWidth: 0.6, maxWidth: 1.3 }); // the page's lane width range
+  assert.ok(t.lock([], 0, JOG_119_99));
+  // Lines extrapolated to the runner (x = 0): own lane, never the neighbor line at +1.75 m.
+  close(t.last.leftY, -0.75, 0.08);
+  close(t.last.rightY, 0.55, 0.08);
+  assert.equal(t.last.status, LaneStatus.INSIDE);
+});
+
+test('right after a lock the output is low-confidence for settleFrames, then normal', () => {
+  const t = new LaneTracker();
+  assert.ok(t.lock([], 0, segmentsFor(0)));
+  assert.equal(t.last.lowConfidence, true);
+  let out;
+  for (let i = 0; i < t.cfg.settleFrames; i++) out = t.update([], 0, segmentsFor(0));
+  assert.equal(out.lowConfidence, false);
+  assert.equal(out.confidence, 1);
+});
+
+test('two lines that are not a lane width apart: the one off the prediction is dropped', () => {
+  const t = new LaneTracker();
+  assert.ok(t.lock([], 0, segmentsFor(0)));
+  // Right line hidden, a shadow edge 20 cm inside the lane instead (within the first gate):
+  // spacing 1.02 m, off the lane width by 16%.
+  const segs = segmentsFor(0).map((s) => ({ ...s, peaks: s.peaks.map((p) => (Math.abs(p.y - 0.61) < 0.05 ? { ...p, y: 0.41 } : p)) }));
+  const out = t.update([], 0, segs);
+  assert.deepEqual(out.matched, { left: true, right: false });
+  close(out.eY, 0, 0.02);
+});
+
+test('after coasting, a sudden centerline jump is held until it persists (jumpFrames)', () => {
+  const t = new LaneTracker();
+  assert.ok(t.lock([], 0, segmentsFor(0)));
+  const empty = segmentsFor(0).map((s) => ({ ...s, peaks: [] }));
+  for (let i = 0; i < 15; i++) t.update([], 0, empty); // coasting widens the gate to 0.40 m
+  // Then lines 0.34 m off (a neighbor/diagonal line inside the widened gate): not trusted at once.
+  const out = t.update([], 0, segmentsFor(0.34));
+  close(out.eY, 0, 0.05);
+});

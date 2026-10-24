@@ -53,6 +53,21 @@ export const DEFAULT_TRACKER_CONFIG = {
   // and the lane coasted to LOST. The previous slope is carried over; while coasting (no line
   // matched last frame) it decays by slopeDecay per frame toward the aligned frame's 0.
   slopeDecay: 0.5,
+  // --- Hybrid rules (each one off with 0/false; all off = the tracker above exactly) ---
+  // Lock / re-lock takes the pair around the runner: the nearest line that continues on each side
+  // (left < 0 < right), about one lane width apart, instead of the longest/straightest pair, which
+  // could be a neighbor lane (e.g. jogging 120 s: peaks at -63/+49 cm but the lane to the right won).
+  lockStraddle: true,
+  // For this many frames after a lock the output is marked lowConfidence (and inside/outside is not
+  // switched), so the belt does not give strong cues from a lane it has only just found (0.5 s).
+  settleFrames: 15,
+  // Both lines matched but their spacing is off the lane width by more than this fraction: the line
+  // whose implied centerline is farther from the prediction is dropped; the other + width is used.
+  widthCheck: 0.15,
+  // A centerline jump larger than this (m) from the prediction is held as a coasting frame until it
+  // has persisted jumpFrames frames: a runner does not teleport, a neighbor/diagonal line does.
+  jumpGuard: 0.3,
+  jumpFrames: 6,
 };
 
 export const LaneStatus = Object.freeze({
@@ -83,6 +98,8 @@ export class LaneTracker {
     this.shownStatus = LaneStatus.INSIDE; // debounced inside/outside status
     this.pendingStatus = null;
     this.pendingFrames = 0;
+    this.settle = 0; // frames left in the low-confidence period after a lock
+    this.jumpCount = 0;
   }
 
   // The lane a Lock would take right now, or null: in the nearest segment that shows a line on each
@@ -91,6 +108,7 @@ export class LaneTracker {
   candidate(segments) {
     const { segmentGate } = this.cfg;
     const minChain = segments.length > 1 ? 2 : 1;
+    if (this.cfg.lockStraddle) return this.straddleCandidate(segments, minChain);
     for (const seg of segments) {
       // Per side, the nearest peak that continues as a line. The second nearest is only considered
       // when the nearest does not continue (a white thing between runner and line); otherwise a
@@ -131,6 +149,42 @@ export class LaneTracker {
     return null;
   }
 
+  // The pair around the runner: in the nearest segment with a usable line on each side, the line
+  // nearest to the runner on the left and on the right that continue over minChain segments, if
+  // their spacing is a lane width.
+  straddleCandidate(segments, minChain) {
+    const { segmentGate } = this.cfg;
+    // Nearest line that continues; a chain that starts on a short white thing and hops onto a line
+    // (it bends where it hops) yields to the next nearest one if that one is straight.
+    const nearestLine = (peaks) => {
+      const options = [];
+      for (const p of [...peaks].sort((a, b) => Math.abs(a.y) - Math.abs(b.y))) {
+        const chain = followLine(segments, p.y, 0, 0, segmentGate, segmentGate);
+        if (chain.length < minChain) continue;
+        options.push({ p, chain, rms: chainRms(chain) });
+        if (options.length === 2) break;
+      }
+      if (!options.length) return null;
+      if (options.length === 2 && options[0].rms > 0.02 && options[1].rms < options[0].rms) return options[1];
+      return options[0];
+    };
+    for (const seg of segments) {
+      const left = nearestLine(seg.peaks.filter((p) => p.y < 0));
+      const right = nearestLine(seg.peaks.filter((p) => p.y >= 0));
+      if (!left || !right) continue;
+      const width = right.p.y - left.p.y;
+      if (!this.widthOk(width)) continue;
+      const obs = [
+        ...left.chain.map((p) => ({ x: p.x, y: p.y + width / 2 })),
+        ...right.chain.map((p) => ({ x: p.x, y: p.y - width / 2 })),
+      ];
+      const fit = fitCenterline(obs, 0);
+      return { center: fit.a, slope: fit.hasB ? fit.b : 0, curve: fit.c, width,
+               polylines: { left: left.chain, right: right.chain } };
+    }
+    return null;
+  }
+
   // Locks onto the line just left and just right of the runner. With segments, both lines must
   // continue outward (see candidate()). Returns true on success.
   lock(peaks, heading, segments = null) {
@@ -145,6 +199,7 @@ export class LaneTracker {
       this.width = cand.width;
       this.heading = heading;
       this.polylines = cand.polylines;
+      this.settle = this.cfg.settleFrames;
       this.last = this.output({ left: true, right: true }, 1);
       return true;
     }
@@ -187,8 +242,21 @@ export class LaneTracker {
       const chain = followLine(segs, startY, slope, this.curve, g, segmentGate);
       return chain.length >= minChain ? chain : [];
     };
-    const leftChain = follow(predicted - half);
-    const rightChain = follow(predicted + half);
+    let leftChain = follow(predicted - half);
+    let rightChain = follow(predicted + half);
+    if (this.settle > 0) this.settle--;
+    // Spacing check: drop the side that disagrees with the prediction when the two lines are not a
+    // lane width apart (one of them is a neighbor line, a diagonal or a shadow edge).
+    if (this.cfg.widthCheck > 0 && leftChain.length && rightChain.length) {
+      const meanY = (c) => c.reduce((acc, p) => acc + p.y, 0) / c.length;
+      const spacing = meanY(rightChain) - meanY(leftChain);
+      if (Math.abs(spacing - this.width) > this.cfg.widthCheck * this.width) {
+        const offL = Math.abs(meanY(leftChain) + half - predicted);
+        const offR = Math.abs(meanY(rightChain) - half - predicted);
+        if (offL > offR) leftChain = [];
+        else rightChain = [];
+      }
+    }
     const matched = { left: leftChain.length > 0, right: rightChain.length > 0 };
     const obs = [
       ...leftChain.map((p) => ({ x: p.x, y: p.y + half })),
@@ -217,6 +285,17 @@ export class LaneTracker {
 
     const fit = fitCenterline(obs, this.curve);
     const residual = fit.a - predicted;
+    // Jump guard: a sudden centerline jump is not trusted until it persists.
+    if (this.cfg.jumpGuard > 0 && Math.abs(residual) > this.cfg.jumpGuard && ++this.jumpCount < this.cfg.jumpFrames) {
+      this.centerRate *= this.cfg.coastRateDecay;
+      this.center += this.centerRate;
+      this.slope = slope;
+      this.heading = heading;
+      this.missed++;
+      this.last = this.debounced(this.output({ left: false, right: false }, 0.3), false);
+      return this.last;
+    }
+    this.jumpCount = 0;
     this.center = predicted + alpha * residual;
     this.centerRate += beta * residual;
     // Without two distinct distances the slope is unobservable here; the detector's heading search
@@ -242,7 +321,7 @@ export class LaneTracker {
     if (raw === this.shownStatus) {
       this.pendingStatus = null;
       this.pendingFrames = 0;
-    } else if (observed) {
+    } else if (observed && this.settle === 0) {
       if (raw === this.pendingStatus) this.pendingFrames++;
       else { this.pendingStatus = raw; this.pendingFrames = 1; }
       if (this.pendingFrames >= this.cfg.statusFrames) {
@@ -275,7 +354,8 @@ export class LaneTracker {
       shape: { a: this.center, b: this.slope, c: this.curve }, // y(x) in the aligned frame
       polylines: this.polylines, // matched line points per segment, aligned frame
       matched: { left: !!matched.left, right: !!matched.right },
-      confidence,
+      confidence: this.settle > 0 ? Math.min(confidence, 0.5) : confidence,
+      lowConfidence: this.settle > 0,
     };
   }
 }
