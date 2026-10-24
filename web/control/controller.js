@@ -13,14 +13,23 @@ export const motorBit = (n) => 1 << (n - 1);
 
 export const DEFAULT_CONTROL_CONFIG = {
   kp: 1.0, // on predicted eY (m -> m)
-  kd: 0.3, // s, on vY
-  reactionTime: 0.25, // s: look ahead by the runner's reaction delay
-  // Pure pursuit: aim at the centerline point this far ahead. Heading error and curvature both act
-  // through it, so on a bend the cue already says "turn" while the runner is still centered
-  // (with 1.5 m and no shared aim point, a 12 m bend stayed under the deadband and read STRAIGHT).
-  lookahead: 2.5, // m
-  deadband: 0.15, // m of |u|: silent zone (heartbeat only)
-  strong: 0.35, // m of |u|: big-turn zone starts here
+  // Jogging (measured on real-track clips, docs/phone-pipeline.md): the chest camera yaws ±15° at
+  // stride frequency (1.4 Hz) and the measured heading carries a steady +3..6° offset (mount yaw).
+  // Through a 2.5 m pure-pursuit lookahead that became ±50-90 cm of effort: the belt flipped
+  // left/right with every stride (~390 cue changes/min while inside the lane). So the cue is driven
+  // by the stride-averaged lateral offset, the heading only after a stride-cancelling average minus
+  // its slowly learned offset and through a short lookahead, and the curvature as before.
+  kd: 0, // s, on vY (vY follows the stride sway; 0.3 in the original pure-pursuit tuning)
+  reactionTime: 0, // s: lead on eY from vY (0.25 originally)
+  positionAvgS: 0.7, // s: moving average of eY, about one stride (two steps) when jogging
+  headingAvgS: 2, // s: moving average of ePsi, several strides
+  headingBiasS: 15, // s: time constant of the learned steady heading offset (0 = no correction)
+  headingLookahead: 1.0, // m: weight of the averaged heading error (2.5 in pure pursuit)
+  // Curvature acts through this lookahead, so on a 12 m bend the cue already says "turn" while the
+  // runner is still centered; a 36.5 m track bend alone stays under the deadband.
+  lookahead: 2.5, // m (curvature lookahead; aim point drawn this far ahead)
+  deadband: 0.2, // m of |u|: silent zone (heartbeat only); 0.15 with pure pursuit, 0.2 measured best with the averaged cue
+  strong: 0.4, // m of |u|: big-turn zone starts here (0.35 with pure pursuit)
   hysteresis: 0.05, // m: leave a zone only this far below its entry threshold
   saturate: 0.6, // m of |u|: fastest pulses from here on
   slowPeriodMs: 600,
@@ -36,18 +45,51 @@ export class HapticController {
   constructor(config = {}) {
     this.cfg = { ...DEFAULT_CONTROL_CONFIG, ...config };
     this.zone = 0; // 0 straight, 1 small turn, 2 big turn
+    this.reset();
   }
 
-  // Lateral position (m, + = right) of the aim point: the centerline `lookahead` meters ahead, seen
-  // from the runner's straight-ahead path. Centerline at the runner is at -eY, its direction is
-  // -ePsi relative to the runner, and it bends by curvature/2 * L^2 over L meters.
+  // Forget the averaging history (new lock, lost lane).
+  reset() {
+    this.history = []; // { t, eY, ePsi } over the last max(positionAvgS, headingAvgS) seconds
+    this.headingBias = 0;
+    this.lastT = null;
+  }
+
+  // Averages eY and ePsi over their windows ending at tMs, and learns the steady heading offset.
+  // Without a time (tests, legacy callers) the current values are used as they are.
+  filtered(state, tMs) {
+    const c = this.cfg;
+    if (tMs == null) return { eY: state.eY, ePsi: state.ePsi ?? 0 };
+    this.history.push({ t: tMs, eY: state.eY, ePsi: state.ePsi ?? 0 });
+    const keep = Math.max(c.positionAvgS, c.headingAvgS) * 1000;
+    while (this.history.length && this.history[0].t < tMs - keep) this.history.shift();
+    const mean = (key, windowS) => {
+      const from = tMs - windowS * 1000;
+      let sum = 0, n = 0;
+      for (const h of this.history) if (h.t >= from) { sum += h[key]; n++; }
+      return n ? sum / n : state[key] ?? 0;
+    };
+    const eY = mean('eY', c.positionAvgS);
+    let ePsi = mean('ePsi', c.headingAvgS);
+    if (c.headingBiasS > 0) {
+      const dt = this.lastT == null ? 0 : Math.max(0, (tMs - this.lastT) / 1000);
+      this.headingBias += Math.min(1, dt / c.headingBiasS) * (ePsi - this.headingBias);
+      ePsi -= this.headingBias;
+    }
+    this.lastT = tMs;
+    return { eY, ePsi };
+  }
+
+  // Lateral position (m, + = right) of the aim point, seen from the runner's straight-ahead path:
+  // the centerline at the runner is at -eY, heading error ePsi acts over headingLookahead and the
+  // curvature over lookahead (both lookaheads 2.5 m = the original pure pursuit).
   aimPoint({ eY, ePsi = 0 }, curvature = 0) {
-    const L = this.cfg.lookahead;
-    return { x: L, y: -eY - Math.tan(ePsi) * L + (curvature / 2) * L * L };
+    const { lookahead: L, headingLookahead: Lh } = this.cfg;
+    return { x: L, y: -eY - Math.tan(ePsi) * Lh + (curvature / 2) * L * L };
   }
 
-  // Control effort in meters: + = the runner should move left. Pure pursuit toward the aim point,
-  // plus a damping term on lateral speed and the reaction-time lead on eY.
+  // Control effort in meters: + = the runner should move left. Toward the aim point, plus an
+  // optional damping term on lateral speed and reaction-time lead on eY (both off by default).
   effort(state, curvature = 0) {
     const { kp, kd, reactionTime } = this.cfg;
     const vY = state.vY ?? 0;
@@ -56,8 +98,10 @@ export class HapticController {
   }
 
   // state: LaneEstimator.state; status: LaneTracker status; curvature: LaneTracker curvature (1/m).
-  step(state, status, curvature = 0) {
+  // tMs: frame time (ms); when given, eY and ePsi are averaged as described in the config.
+  step(state, status, curvature = 0, tMs = null) {
     const c = this.cfg;
+    if (status === LaneStatus.UNLOCKED || status === LaneStatus.LOST) this.reset();
     if (status === LaneStatus.UNLOCKED) {
       this.zone = 0;
       return { pattern: Pattern.OFF, motors: 0, level: 0, periodMs: 0, zone: 0, u: 0 };
@@ -74,7 +118,9 @@ export class HapticController {
       };
     }
 
-    const u = this.effort(state, curvature);
+    const f = this.filtered(state, tMs);
+    this.lastAim = this.aimPoint({ ...state, eY: f.eY, ePsi: f.ePsi }, curvature); // what the cue steers toward (for drawing)
+    const u = this.effort({ ...state, eY: f.eY, ePsi: f.ePsi }, curvature);
     let goLeft = u > 0;
     const mag = Math.abs(u);
     if (status === LaneStatus.OUTSIDE_LEFT || status === LaneStatus.OUTSIDE_RIGHT) {
