@@ -155,12 +155,17 @@ test('no lane: nothing to lock when the lines do not continue over two segments'
   assert.equal(t.lock([], 0, scattered), false);
 });
 
-test('lane width is configurable (a practice lane of 73 cm)', () => {
+test('lane width is a range: default fits a real track, a 0.5-1.0 m range fits taped practice lanes', () => {
   assert.equal(new LaneTracker().lock([], 0, segmentsFor(0, { width: 0.73 })), false);
-  const t = new LaneTracker({ laneWidth: 0.73 });
-  assert.ok(t.lock([], 0, segmentsFor(0.1, { width: 0.73 })));
-  close(t.last.width, 0.73, 1e-9);
-  close(t.last.eY, 0.1, 1e-9);
+  assert.ok(new LaneTracker().lock([], 0, segmentsFor(0, { width: 1.22 })));
+  const practice = { minWidth: 0.5, maxWidth: 1.0 };
+  for (const width of [0.55, 0.73, 0.95]) {
+    const t = new LaneTracker(practice);
+    assert.ok(t.lock([], 0, segmentsFor(0.1, { width })), `width ${width}`);
+    close(t.last.width, width, 1e-9);
+    close(t.last.eY, 0.1, 1e-9);
+  }
+  assert.equal(new LaneTracker(practice).lock([], 0, segmentsFor(0, { width: 1.22 })), false);
 });
 
 test('sliding window follows a lane that bends away and keeps the lines when one segment is missing', () => {

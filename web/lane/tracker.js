@@ -26,8 +26,11 @@
 import { LANE_WIDTH_M } from './ground.js';
 
 export const DEFAULT_TRACKER_CONFIG = {
-  laneWidth: LANE_WIDTH_M,
-  lockWidthTolerance: 0.25, // fraction of laneWidth allowed between L and R at lock time
+  laneWidth: LANE_WIDTH_M, // starting width before a lock measures the real one
+  // Accepted distance between the two lines at lock time. The default fits a real track
+  // (1.22 m); taped practice lanes vary, and vision only measures width roughly anyway.
+  minWidth: 0.9,
+  maxWidth: 1.55,
   gate: 0.25, // m: max distance between a predicted line and the peak it is matched to
   gateGrowthPerFrame: 0.01, // m: the gate widens while coasting, capped below half a lane
   segmentGate: 0.12, // m: from one segment to the next, the line may deviate this much from its course
@@ -70,7 +73,7 @@ export class LaneTracker {
   // side of the runner about one lane width apart, follow both lines outward (sliding window).
   // Used to preview the lane before locking and by lock() itself.
   candidate(segments) {
-    const { laneWidth, lockWidthTolerance, segmentGate } = this.cfg;
+    const { segmentGate } = this.cfg;
     const minChain = segments.length > 1 ? 2 : 1;
     for (const seg of segments) {
       // Per side, the nearest peak that continues as a line. The second nearest is only considered
@@ -93,7 +96,7 @@ export class LaneTracker {
       for (const { p: left, chain: leftChain } of lefts) {
         for (const { p: right, chain: rightChain } of rights) {
           const width = right.y - left.y;
-          if (Math.abs(width - laneWidth) > lockWidthTolerance * laneWidth) continue;
+          if (!this.widthOk(width)) continue;
           // Longer and straighter wins: a chain that started on junk and hopped onto the real line
           // bends where it hopped.
           const score = leftChain.length + rightChain.length - (chainRms(leftChain) + chainRms(rightChain)) / 0.02;
@@ -129,12 +132,11 @@ export class LaneTracker {
       this.last = this.output({ left: true, right: true }, 1);
       return true;
     }
-    const { laneWidth, lockWidthTolerance } = this.cfg;
     const left = nearest(peaks.filter((p) => p.y < 0), 0);
     const right = nearest(peaks.filter((p) => p.y >= 0), 0);
     if (!left || !right) return false;
     const width = right.y - left.y;
-    if (Math.abs(width - laneWidth) > lockWidthTolerance * laneWidth) return false;
+    if (!this.widthOk(width)) return false;
     this.reset();
     this.locked = true;
     this.center = (left.y + right.y) / 2;
@@ -142,6 +144,10 @@ export class LaneTracker {
     this.heading = heading;
     this.last = this.output({ left: true, right: true }, 1);
     return true;
+  }
+
+  widthOk(width) {
+    return width >= this.cfg.minWidth && width <= this.cfg.maxWidth;
   }
 
   // peaks: detector peaks over the whole band (used when segments are not given: straight model).
