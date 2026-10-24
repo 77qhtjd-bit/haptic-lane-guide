@@ -1,0 +1,399 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lane Replay</title>
+<style>
+  body { margin: 0; padding: 12px; font: 14px/1.4 system-ui, sans-serif; background: #111; color: #eee; }
+  button, select, input { font-size: 14px; padding: 6px 10px; margin: 2px; }
+  input[type=number] { width: 64px; }
+  .row { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin: 6px 0; }
+  .views { display: flex; flex-wrap: wrap; gap: 10px; align-items: flex-start; }
+  canvas { background: #000; }
+  #stats, #summary { white-space: pre; font-family: ui-monospace, monospace; font-size: 13px; }
+  #log { white-space: pre-wrap; font-family: ui-monospace, monospace; color: #f88; max-height: 120px; overflow: auto; }
+  video { display: none; }
+  h3 { margin: 10px 0 4px; font-size: 15px; color: #aaa; }
+</style>
+</head>
+<body>
+<!-- Offline replay of a web/record.html clip (rec_*.mp4 + rec_*.json) through the team's live
+     pipeline (lane/detector, lane/tracker, control/estimator, control/controller), so the lane
+     detection can be evaluated and tuned on real track footage without going back to the track.
+     Run in desktop Chrome. Files are read locally; nothing is uploaded. -->
+<div class="row">
+  <label>Clip (.mp4 + .json) <input type="file" id="files" multiple accept=".mp4,.webm,.json"></label>
+  <button id="play" disabled>Play</button>
+  <button id="lockBtn" disabled>Lock lane</button>
+  <button id="restart" disabled>Restart</button>
+  <label>speed <select id="speed"><option>0.25</option><option>0.5</option><option selected>1</option><option>2</option></select></label>
+  <label><input type="checkbox" id="autolock" checked> auto lock / re-lock after lost</label>
+  <button id="csv" disabled>Download CSV</button>
+  <button id="sumBtn" disabled>Download summary</button>
+</div>
+<div class="row">
+  <label>h(m) <input id="h" type="number" step="0.05" value="1.3"></label>
+  <label>hfov <input id="hfov" type="number" step="1" value="53"></label>
+  <label>Vmin <input id="vmin" type="number" step="5" value="180"></label>
+  <label>Smax <input id="smax" type="number" step="5" value="60"></label>
+  <label>lag(ms) <input id="lag" type="number" step="10" value="30"></label>
+  <label>lane width(m) <input id="laneMin" type="number" step="0.05" value="0.6"> ~ <input id="laneMax" type="number" step="0.05" value="1.3"></label>
+  <span id="clipinfo"></span>
+</div>
+<div class="views">
+  <canvas id="view"></canvas>
+  <canvas id="bev" width="240" height="320"></canvas>
+  <div>
+    <h3>Frame</h3><div id="stats">load a clip</div>
+    <h3>Summary so far</h3><div id="summary">-</div>
+  </div>
+</div>
+<div id="log"></div>
+<video id="video" playsinline muted></video>
+<canvas id="proc" hidden></canvas>
+
+<script async src="./vendor/opencv.js"></script>
+<script type="module">
+import { GroundLineDetector, DEFAULT_CONFIG } from './lane/detector.js';
+import { AttitudeBuffer, upFromOrientation, deviceToCamera } from './lane/ground.js';
+import { LaneTracker, LaneStatus } from './lane/tracker.js';
+import { LaneEstimator, yawRateFromMotion } from './control/estimator.js';
+import { HapticController } from './control/controller.js';
+import { commandToLevels } from './control/protocol.js';
+import { candidateLane, cueText, drawView, drawBev } from './lane/draw.js';
+
+const PAGE_VERSION = 'replay-1';
+const $ = (id) => document.getElementById(id);
+const log = (msg) => { $('log').textContent = `${msg}\n` + $('log').textContent; };
+window.addEventListener('error', (e) => log(`error: ${e.message}`));
+window.addEventListener('unhandledrejection', (e) => log(`rejection: ${e.reason}`));
+
+// Same loader as spike-ground.html: the OpenCV.js module is a thenable and must not be awaited.
+function loadCv() {
+  return new Promise((resolve) => {
+    const poll = () => {
+      const cv = window.cv;
+      if (!cv) return void setTimeout(poll, 50);
+      if (cv.Mat) return resolve({ cv });
+      if (typeof cv.then === 'function') return void cv.then((m) => resolve({ cv: m }));
+      cv.onRuntimeInitialized = () => resolve({ cv });
+    };
+    poll();
+  });
+}
+
+const IMU_STALE_MS = 100;      // same as the live app
+const video = $('video');
+let cv = null;
+let rec = null;                // recording JSON
+let orient = [];               // [{t, beta, gamma}] sorted
+let motion = [];               // [{t, ra, rb, rg}] sorted
+let videoUrl = null;
+
+// ---------- Pipeline state (reset on load / restart / seek) ----------
+let detector = null, detectorKey = '';
+let tracker, estimator, controller, attitude;
+let oi = 0, mi = 0;            // next IMU sample to feed
+let upDevice = null, lastOrientation = null, lastMotionT = -Infinity, lastPredictT = null, yawRate = 0;
+let prevHeading = 0, latest = null;
+let rows = [];                 // per-frame log
+let lastMediaTime = -1;
+let lockEvents = 0, lostEvents = 0, prevStatus = LaneStatus.UNLOCKED, lostSince = null;
+
+function resetPipeline() {
+  tracker = new LaneTracker();
+  estimator = new LaneEstimator();
+  controller = new HapticController();
+  attitude = new AttitudeBuffer();
+  oi = mi = 0;
+  upDevice = null; lastOrientation = null; lastMotionT = -Infinity; lastPredictT = null; yawRate = 0;
+  prevHeading = 0; latest = null; rows = []; lastMediaTime = -1;
+  lockEvents = 0; lostEvents = 0; prevStatus = LaneStatus.UNLOCKED; lostSince = null;
+}
+
+function predictTo(t, rate) {
+  if (lastPredictT !== null && t > lastPredictT) estimator.predict((t - lastPredictT) / 1000, rate);
+  lastPredictT = t;
+}
+
+// Feed all IMU samples up to time t (recording clock, ms), in time order, as the live listeners would.
+function feedImu(t) {
+  while (true) {
+    const o = orient[oi], m = motion[mi];
+    const nextO = o && o.t <= t ? o.t : Infinity;
+    const nextM = m && m.t <= t ? m.t : Infinity;
+    if (nextO === Infinity && nextM === Infinity) break;
+    if (nextO <= nextM) {
+      lastOrientation = o;
+      upDevice = upFromOrientation(o.beta, o.gamma);
+      attitude.push(o.t, deviceToCamera(upDevice));
+      oi++;
+    } else {
+      if (upDevice) {
+        yawRate = yawRateFromMotion({ alpha: m.ra, beta: m.rb, gamma: m.rg }, upDevice);
+        lastMotionT = m.t;
+        predictTo(m.t, yawRate);
+      }
+      mi++;
+    }
+  }
+}
+
+// ---------- Loading ----------
+function parseRecording(json) {
+  rec = json;
+  orient = rec.samples.filter((s) => s.k === 'o' && s.be != null).map((s) => ({ t: s.t, beta: s.be, gamma: s.ga }));
+  motion = rec.samples.filter((s) => s.k === 'm').map((s) => ({ t: s.t, ra: s.ra, rb: s.rb, rg: s.rg }));
+  orient.sort((a, b) => a.t - b.t);
+  motion.sort((a, b) => a.t - b.t);
+  $('clipinfo').textContent = `${rec.name} "${rec.memo || ''}"  ${((rec.rec_stop_t - rec.rec_start_t) / 1000).toFixed(0)} s, ` +
+    `${rec.frames?.length ?? '?'} frames, ${orient.length} orientation, ${motion.length} motion samples`;
+}
+
+async function loadFiles(videoBlob, json) {
+  parseRecording(json);
+  if (videoUrl) URL.revokeObjectURL(videoUrl);
+  videoUrl = URL.createObjectURL(videoBlob);
+  video.src = videoUrl;
+  await new Promise((r) => video.addEventListener('loadedmetadata', r, { once: true }));
+  setupCanvases();
+  resetPipeline();
+  for (const id of ['play', 'lockBtn', 'restart', 'csv', 'sumBtn']) $(id).disabled = false;
+  log(`loaded ${rec.name}: video ${video.videoWidth}x${video.videoHeight}, ${video.duration.toFixed(1)} s`);
+}
+
+$('files').onchange = async () => {
+  const files = [...$('files').files];
+  const v = files.find((f) => /\.(mp4|webm)$/i.test(f.name));
+  const j = files.find((f) => /\.json$/i.test(f.name));
+  if (!v || !j) { log('choose both the .mp4 and the .json of one clip'); return; }
+  await loadFiles(v, JSON.parse(await j.text()));
+};
+
+// ?clip=<path without extension> loads <path>.mp4 + <path>.json from this server (testing / headless).
+const params = new URLSearchParams(location.search);
+async function loadFromUrl(base) {
+  const [v, j] = await Promise.all([fetch(base + '.mp4').then((r) => r.blob()), fetch(base + '.json').then((r) => r.json())]);
+  await loadFiles(v, j);
+}
+
+// ---------- Per-frame processing ----------
+let procWidth = DEFAULT_CONFIG.procWidth, procHeight = 0, pctx = null, vctx = null;
+
+function setupCanvases() {
+  procHeight = Math.round((procWidth * video.videoHeight) / video.videoWidth);
+  const proc = $('proc');
+  proc.width = procWidth;
+  proc.height = procHeight;
+  pctx = proc.getContext('2d', { willReadFrequently: true });
+  $('view').width = procWidth * 2;
+  $('view').height = procHeight * 2;
+  vctx = $('view').getContext('2d');
+}
+
+function tryLock() {
+  const ok = latest?.ok && tracker.lock(latest.peaks, latest.heading, latest.segments);
+  if (ok) {
+    controller.zone = 0;
+    estimator.reset(tracker.last.eY, tracker.last.ePsi);
+    lockEvents++;
+  }
+  return ok;
+}
+
+function processFrame(mediaTime) {
+  if (!cv) return;   // OpenCV still loading
+  // Video time on the recording clock: start + container timestamp (measured ~20-30 ms after the IMU).
+  const T = rec.rec_start_t + mediaTime * 1000;
+  const tCapture = T - +$('lag').value;
+  feedImu(T);
+
+  const cfg = { procWidth, procHeight, cameraHeight: +$('h').value, hfovDeg: +$('hfov').value,
+                whiteVMin: +$('vmin').value, whiteSMax: +$('smax').value };
+  const key = `${cfg.hfovDeg}|${cfg.cameraHeight}`;
+  if (key !== detectorKey) {
+    detector?.delete();
+    detector = new GroundLineDetector(cv, cfg);
+    detectorKey = key;
+  }
+  tracker.cfg.minWidth = +$('laneMin').value;
+  tracker.cfg.maxWidth = +$('laneMax').value;
+  detector.cfg.laneWidth = tracker.locked ? tracker.width : (tracker.cfg.minWidth + tracker.cfg.maxWidth) / 2;
+  if (cfg.whiteVMin !== detector.cfg.whiteVMin || cfg.whiteSMax !== detector.cfg.whiteSMax) {
+    detector.setThresholds(cfg.whiteVMin, cfg.whiteSMax);
+  }
+
+  pctx.drawImage(video, 0, 0, procWidth, procHeight);
+  const img = pctx.getImageData(0, 0, procWidth, procHeight);
+  const up = attitude.at(tCapture);
+  if (!up) return;   // no orientation yet
+
+  const t0 = performance.now();
+  const rgba = cv.matFromImageData(img);
+  const res = detector.process(rgba, up, prevHeading);
+  rgba.delete();
+  latest = res;
+  let lane = tracker.update(res.ok ? res.peaks : [], res.ok ? res.heading : tracker.heading, res.ok ? res.segments : []);
+  if (tracker.locked && lane.status !== LaneStatus.LOST) prevHeading = lane.heading;
+  else prevHeading = res.ok && res.peaks.length ? res.heading : 0;
+
+  const candidate = !tracker.locked && res.ok ? tracker.candidate(res.segments) : null;
+  if ($('autolock').checked) {
+    // Re-lock after 1 s of LOST, so the whole clip is evaluated (each re-lock is counted).
+    if (lane.status === LaneStatus.LOST && lostSince !== null && T - lostSince > 1000) tracker.reset();
+    if (!tracker.locked && candidate && tryLock()) lane = tracker.last;
+  }
+  if (lane.status === LaneStatus.LOST && prevStatus !== LaneStatus.LOST) { lostEvents++; lostSince = T; }
+  if (lane.status !== LaneStatus.LOST) lostSince = null;
+  prevStatus = lane.status;
+
+  // Same filter / control steps as the live app.
+  const imuAgeMs = T - lastMotionT;
+  const attitudeAgeMs = lastOrientation ? T - lastOrientation.t : Infinity;
+  if (imuAgeMs > IMU_STALE_MS) predictTo(T, 0);
+  if (lane.confidence > 0 && lane.status !== LaneStatus.LOST && lane.status !== LaneStatus.UNLOCKED) {
+    estimator.update(lane.eY, lane.ePsi, lane.confidence * (attitudeAgeMs > IMU_STALE_MS ? 0.4 : 1));
+  }
+  const state = estimator.initialized ? estimator.state : { eY: lane.eY ?? 0, vY: 0, ePsi: lane.ePsi ?? 0 };
+  const cmd = controller.step(state, lane.status, lane.curvature ?? 0);
+  const levels = commandToLevels(cmd);
+  const procMs = performance.now() - t0;
+  const cue = cueText(cmd, tracker.locked, !!candidate);
+
+  rows.push({
+    t_s: +((T - rec.rec_start_t) / 1000).toFixed(3), status: lane.status, confidence: lane.confidence ?? 0,
+    eY_raw_m: lane.eY ?? '', ePsi_raw_rad: lane.ePsi ?? '', curvature_1pm: lane.curvature ?? '',
+    eY_kf_m: state.eY, vY_kf_mps: state.vY, ePsi_kf_rad: state.ePsi,
+    lane_width_m: tracker.locked ? lane.width : '',
+    matched: tracker.locked && lane.matched ? `${lane.matched.left ? 'L' : ''}${lane.matched.right ? 'R' : ''}` : '',
+    u_m: cmd.u, zone: cmd.zone, cue: cue.replace(/[◀▶]/g, '').trim(),
+    L1: levels[0], L2: levels[1], L3: levels[2], L4: levels[3], L5: levels[4],
+    imu_age_ms: Number.isFinite(imuAgeMs) ? Math.round(imuAgeMs) : '',
+    beta: lastOrientation?.beta ?? '', gamma: lastOrientation?.gamma ?? '',
+    height_est_m: res.heightEstimate ?? '', mask_px: res.maskPixels ?? '', proc_ms: +procMs.toFixed(2),
+    reason: res.ok ? '' : res.reason,
+  });
+
+  const shown = tracker.locked ? lane : candidate && candidateLane(candidate, res.heading);
+  drawView(vctx, img, detector, res, shown, cue,
+    tracker.locked && lane.status !== LaneStatus.LOST ? controller.aimPoint(state, lane.curvature ?? 0) : null);
+  drawBev($('bev'), res, shown);
+  const cm = (v) => (v == null || v === '' || Number.isNaN(v) ? '-' : (v * 100).toFixed(1));
+  $('stats').textContent = [
+    `t ${((T - rec.rec_start_t) / 1000).toFixed(2)} s   process ${procMs.toFixed(1)} ms   mask px ${res.maskPixels ?? '-'}`,
+    `β ${lastOrientation?.beta?.toFixed(1) ?? '-'}  γ ${lastOrientation?.gamma?.toFixed(1) ?? '-'}  imu age ${imuAgeMs.toFixed(0)} ms`,
+    res.ok ? `peaks (cm) ${res.peaks.map((p) => cm(p.y)).join(' ')}` : `not ok: ${res.reason}`,
+    `status ${lane.status}  conf ${(lane.confidence ?? 0).toFixed(2)}  width ${tracker.locked ? cm(lane.width) : '-'} cm`,
+    `eY raw ${cm(lane.eY)}  kf ${cm(state.eY)} cm   ePsi kf ${((state.ePsi * 180) / Math.PI).toFixed(1)}°`,
+    `curve ${lane.curvature && Math.abs(lane.curvature) > 0.005 ? `R ${(1 / lane.curvature).toFixed(0)} m` : 'straight'}`,
+    `cue ${cue || '-'}  zone ${cmd.zone}  levels [${levels.join(' ')}]`,
+    `h estimate ${res.heightEstimate ? res.heightEstimate.toFixed(2) + ' m' : '-'}`,
+  ].join('\n');
+}
+
+// ---------- Summary ----------
+const median = (a) => { if (!a.length) return NaN; const s = [...a].sort((x, y) => x - y); return s[s.length >> 1]; };
+const pct = (a, p) => { if (!a.length) return NaN; const s = [...a].sort((x, y) => x - y); return s[Math.min(s.length - 1, Math.floor(p * s.length))]; };
+function summarize() {
+  const n = rows.length;
+  const count = (st) => rows.filter((r) => r.status === st).length;
+  const locked = rows.filter((r) => r.status !== LaneStatus.UNLOCKED);
+  const inside = rows.filter((r) => r.status === LaneStatus.INSIDE);
+  const both = inside.filter((r) => r.matched === 'LR').length;
+  // Jitter: frame-to-frame change of the filtered offset while inside (cm); a steady runner keeps it small.
+  const dE = [];
+  for (let i = 1; i < rows.length; i++) {
+    if (rows[i].status === LaneStatus.INSIDE && rows[i - 1].status === LaneStatus.INSIDE) dE.push(Math.abs(rows[i].eY_kf_m - rows[i - 1].eY_kf_m) * 100);
+  }
+  const eY = inside.map((r) => r.eY_kf_m * 100);
+  const widths = inside.map((r) => r.lane_width_m).filter((w) => w !== '').map((w) => w * 100);
+  const heights = rows.map((r) => r.height_est_m).filter((h) => h !== '');
+  const reasons = {};
+  for (const r of rows) if (r.reason) reasons[r.reason] = (reasons[r.reason] || 0) + 1;
+  return {
+    page_version: PAGE_VERSION, clip: rec?.name, memo: rec?.memo,
+    settings: { h: +$('h').value, hfov: +$('hfov').value, vmin: +$('vmin').value, smax: +$('smax').value,
+                lag_ms: +$('lag').value, lane_min: +$('laneMin').value, lane_max: +$('laneMax').value, autolock: $('autolock').checked },
+    frames_processed: n, frames_in_clip: rec?.frames?.length ?? null,
+    locked_pct: n ? (100 * locked.length) / n : 0,
+    inside_pct: n ? (100 * inside.length) / n : 0,
+    outside_pct: n ? (100 * (count(LaneStatus.OUTSIDE_LEFT) + count(LaneStatus.OUTSIDE_RIGHT))) / n : 0,
+    lost_pct: n ? (100 * count(LaneStatus.LOST)) / n : 0,
+    both_lines_pct_of_inside: inside.length ? (100 * both) / inside.length : 0,
+    locks: lockEvents, lost_events: lostEvents,
+    eY_kf_cm: { median: median(eY), p5: pct(eY, 0.05), p95: pct(eY, 0.95) },
+    eY_step_cm: { median: median(dE), p95: pct(dE, 0.95) },
+    lane_width_cm: { median: median(widths), p5: pct(widths, 0.05), p95: pct(widths, 0.95) },
+    height_estimate_m: median(heights),
+    proc_ms: { median: median(rows.map((r) => r.proc_ms)), p95: pct(rows.map((r) => r.proc_ms), 0.95) },
+    not_ok_reasons: reasons,
+  };
+}
+function showSummary() {
+  const s = summarize();
+  const f = (v, d = 1) => (Number.isFinite(v) ? v.toFixed(d) : '-');
+  $('summary').textContent = [
+    `frames ${s.frames_processed} / ${s.frames_in_clip ?? '?'}`,
+    `locked ${f(s.locked_pct)}%   inside ${f(s.inside_pct)}%   outside ${f(s.outside_pct)}%   lost ${f(s.lost_pct)}%`,
+    `both lines matched ${f(s.both_lines_pct_of_inside)}% of inside frames`,
+    `locks ${s.locks}   lost events ${s.lost_events}`,
+    `eY kf (cm) median ${f(s.eY_kf_cm.median)}  p5 ${f(s.eY_kf_cm.p5)}  p95 ${f(s.eY_kf_cm.p95)}`,
+    `eY step/frame (cm) median ${f(s.eY_step_cm.median, 2)}  p95 ${f(s.eY_step_cm.p95, 2)}`,
+    `lane width (cm) median ${f(s.lane_width_cm.median)}  p5 ${f(s.lane_width_cm.p5)}  p95 ${f(s.lane_width_cm.p95)}`,
+    `height estimate ${f(s.height_estimate_m, 2)} m   process ${f(s.proc_ms.median, 1)} / ${f(s.proc_ms.p95, 1)} ms`,
+  ].join('\n');
+  return s;
+}
+
+// ---------- Playback ----------
+function onVideoFrame(now, md) {
+  if (md.mediaTime !== lastMediaTime) {
+    lastMediaTime = md.mediaTime;
+    try { processFrame(md.mediaTime); } catch (e) { log(`frame error: ${e.message}`); }
+  }
+  if (!video.paused && !video.ended) video.requestVideoFrameCallback(onVideoFrame);
+}
+video.addEventListener('play', () => video.requestVideoFrameCallback(onVideoFrame));
+video.addEventListener('ended', () => { $('play').textContent = 'Play'; showSummary(); window.replayDone = true; log('end of clip'); });
+setInterval(() => { if (rec && rows.length) showSummary(); }, 1000);
+
+$('play').onclick = () => {
+  if (video.paused) { video.playbackRate = +$('speed').value; video.play(); $('play').textContent = 'Pause'; }
+  else { video.pause(); $('play').textContent = 'Play'; }
+};
+$('speed').onchange = () => { video.playbackRate = +$('speed').value; };
+$('lockBtn').onclick = () => log(tryLock() ? `locked: width ${(tracker.width * 100).toFixed(0)} cm` : 'lock failed (no lane candidate in this frame)');
+$('restart').onclick = () => { video.pause(); video.currentTime = 0; resetPipeline(); $('play').textContent = 'Play'; };
+function download(name, text, type) {
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([text], { type }));
+  a.download = name;
+  a.click();
+}
+function toCsv() {
+  if (!rows.length) return '';
+  const cols = Object.keys(rows[0]);
+  return [cols.join(','), ...rows.map((r) => cols.map((c) => r[c]).join(','))].join('\n');
+}
+$('csv').onclick = () => download(`${rec.name}_replay.csv`, toCsv(), 'text/csv');
+$('sumBtn').onclick = () => download(`${rec.name}_replay_summary.json`, JSON.stringify(summarize(), null, 2), 'application/json');
+
+// Exposed for headless runs.
+window.replayApi = { summarize, toCsv, get rows() { return rows; } };
+
+// ---------- Start ----------
+log(`${PAGE_VERSION}: loading OpenCV...`);
+loadCv().then(async ({ cv: m }) => {
+  cv = m;
+  log('OpenCV ready');
+  const base = params.get('clip');
+  if (base) {
+    await loadFromUrl(base);
+    if (params.get('speed')) $('speed').value = params.get('speed');
+    if (params.get('auto')) { video.playbackRate = +$('speed').value; video.play(); }
+  }
+});
+</script>
+</body>
+</html>
