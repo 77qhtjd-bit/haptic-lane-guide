@@ -103,8 +103,8 @@ test('controller: small and big errors use motors 2/4 and 1/5 toward the lane ce
 });
 
 test('controller: heading error alone steers before the offset grows', () => {
-  // Centered but pointing 5 deg right -> move left (aim point 22 cm left at 2.5 m).
-  const cmd = new HapticController().step({ eY: 0, vY: 0, ePsi: 5 * DEG }, LaneStatus.INSIDE);
+  // Centered but pointing 15 deg right -> move left (aim 27 cm left over the 1 m heading lookahead).
+  const cmd = new HapticController().step({ eY: 0, vY: 0, ePsi: 15 * DEG }, LaneStatus.INSIDE);
   assert.equal(cmd.motors, motorBit(2));
 });
 
@@ -121,14 +121,14 @@ test('controller: centered on a 12 m bend, the cue already says turn into the be
 test('controller: aim point is the centerline ahead as seen from the runner', () => {
   const ctl = new HapticController();
   close(ctl.aimPoint({ eY: 0.2, ePsi: 0 }).y, -0.2, 1e-12); // runner right of center -> aim left
-  close(ctl.aimPoint({ eY: 0, ePsi: 0.1 }).y, -Math.tan(0.1) * 2.5, 1e-12); // pointing right -> aim left
+  close(ctl.aimPoint({ eY: 0, ePsi: 0.1 }).y, -Math.tan(0.1) * ctl.cfg.headingLookahead, 1e-12); // pointing right -> aim left
 });
 
 test('controller: hysteresis stops the cue flickering on a threshold', () => {
   const ctl = new HapticController();
   const motors = [];
   for (let i = 0; i < 40; i++) {
-    const eY = 0.15 + 0.02 * Math.sin(i); // jitter around the 15 cm deadband edge
+    const eY = ctl.cfg.deadband + 0.02 * Math.sin(i); // jitter around the deadband edge
     motors.push(ctl.step({ eY }, LaneStatus.INSIDE).motors);
   }
   const changes = motors.slice(1).filter((m, i) => m !== motors[i]).length;
@@ -171,4 +171,29 @@ test('commands become per-motor levels: one motor, both outer motors for stop, z
 
 test('packet layout matches the firmware: [seq lo, seq hi, L1..L5]', () => {
   assert.deepEqual([...encodeLevels(0x1234, [0, 116, 0, 0, 300])], [0x34, 0x12, 0, 116, 0, 0, 255]);
+});
+
+test('controller: stride sway (1.4 Hz) is averaged out instead of flipping the belt every step', () => {
+  // Jogging: the chest camera sways ±15 cm and yaws ±15 deg at stride frequency around a runner who
+  // is 5 cm right of center. With frame times the cue stays on the heartbeat.
+  const ctl = new HapticController();
+  const cues = [];
+  for (let i = 0; i < 150; i++) {
+    const t = (i * 1000) / 30;
+    const w = Math.sin(2 * Math.PI * 1.4 * (t / 1000));
+    cues.push(ctl.step({ eY: 0.05 + 0.15 * w, vY: 0, ePsi: 15 * DEG * w }, LaneStatus.INSIDE, 0, t).motors);
+  }
+  const settled = cues.slice(30);
+  assert.ok(settled.every((m) => m === motorBit(3)), 'heartbeat only once the window is full');
+});
+
+test('controller: a steady heading offset (camera mounted turned) is learned, a real drift still steers', () => {
+  const ctl = new HapticController();
+  let cmd;
+  // 60 s centered with the measured heading always 12 deg right: steers at first, then quiet.
+  for (let i = 0; i <= 1800; i++) cmd = ctl.step({ eY: 0, vY: 0, ePsi: 12 * DEG }, LaneStatus.INSIDE, 0, (i * 1000) / 30);
+  assert.equal(cmd.motors, motorBit(3));
+  // Then the runner really drifts 30 cm right: the averaged offset steers left within a second.
+  for (let i = 1; i <= 30; i++) cmd = ctl.step({ eY: 0.3, vY: 0, ePsi: 12 * DEG }, LaneStatus.INSIDE, 0, 60000 + (i * 1000) / 30);
+  assert.equal(cmd.motors, motorBit(2));
 });
