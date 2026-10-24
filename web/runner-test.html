@@ -11,17 +11,31 @@
   label { display: block; margin: 8px 0; font-size: 24px; }
   input[type=checkbox] { width: 26px; height: 26px; vertical-align: middle; }
   .v { font-weight: 700; font-variant-numeric: tabular-nums; }
-  video { width: 120px; float: right; }
+  video { width: 100%; max-height: 35vh; background: #222; object-fit: contain; }
+  .motors { display: flex; gap: 6px; }
+  .motors button { font-size: 22px; padding: 18px 0; background: #333; }
+  .motors button.on { background: #30d158; color: #000; }
+  #alloff { background: #ff453a; }
+  input[type=range] { width: 100%; }
   #errors { color: #ff453a; font-size: 16px; white-space: pre-wrap; }
 </style>
 </head>
 <body>
 <!-- Final-architecture test without any WebSocket: IMU [+ camera] [+ decide() + BLE to the 5-motor belt].
      Results are POSTed to the laptop every 10 s (small JSON) for analysis. -->
-<label><input type="checkbox" id="usecam"> Camera on</label>
-<label><input type="checkbox" id="usedecide"> Decide + BLE (needs camera)</label>
 <button id="ble">Connect Arduino (BLE)</button>
-<button id="start">Start IMU test</button>
+<p style="margin:10px 0 4px">Manual motor test (works without Start):</p>
+<div class="motors">
+  <button data-m="0">M1</button><button data-m="1">M2</button><button data-m="2">M3</button>
+  <button data-m="3">M4</button><button data-m="4">M5</button>
+</div>
+<div>Level <span class="v" id="lvl">200</span> (0 off, 1-254 pulses, 255 continuous)
+  <input type="range" id="level" min="0" max="255" value="200"></div>
+<button id="alloff">All off / stop manual</button>
+<p>Sending L1..L5: <span class="v" id="sending">-</span></p>
+<label><input type="checkbox" id="usecam" checked> Camera on</label>
+<label><input type="checkbox" id="usedecide"> Decide + BLE (placeholder decide(), needs camera)</label>
+<button id="start">Start camera + sensors</button>
 <video id="video" playsinline muted autoplay></video>
 <p>IMU rate: <span class="v" id="hz">-</span></p>
 <p>IMU gaps &gt;200 ms: <span class="v" id="gaps">-</span></p>
@@ -40,7 +54,7 @@
 <div id="errors"></div>
 <script>
 "use strict";
-const PAGE_VERSION = "runner-5motor-1";
+const PAGE_VERSION = "runner-5motor-2";
 const $ = (id) => document.getElementById(id);
 $("ver").textContent = PAGE_VERSION;
 const now = () => performance.timeOrigin + performance.now();
@@ -206,6 +220,7 @@ async function bleSend(seqNo, levels, frameT) {
     lastWriteT = row.write_t;
     pending.set(seqNo, row);
     const buf = new Uint8Array([seqNo & 0xff, seqNo >> 8, ...levels]);
+    lastSent = levels;
     if (bleNoResp) await bleCmd.writeValueWithoutResponse(buf); else await bleCmd.writeValue(buf);
     cnt.writes++;
   } catch (e) { err("BLE write: " + e.message); }
@@ -228,7 +243,7 @@ function decide(pixels, w, h, imu) {
 }
 
 function decideFrame(t) {
-  if (!$("usedecide").checked || !video.videoWidth) return;
+  if (manualLevels || !$("usedecide").checked || !video.videoWidth) return;   // manual test overrides decide()
   if (t - lastDecideT < 1000 / DECIDE_HZ - 5) return;
   lastDecideT = t;
   const w = video.videoWidth, h = video.videoHeight;
@@ -260,6 +275,31 @@ setInterval(() => {   // watchdog: re-arm the frame callback chain; timer fallba
   try { decideFrame(now()); } catch (e) { err("decide: " + e.message); }
 }, 1000 / DECIDE_HZ);
 video.addEventListener("playing", scheduleDecide);
+
+// ---------- Manual motor test ----------
+// While a motor button is selected, its level is sent at 20 Hz (keeps the 300 ms watchdog fed).
+let manualLevels = null, manualMotor = -1, lastSent = null;
+function setManual(m) {
+  manualMotor = m;
+  if (m < 0) manualLevels = null;
+  else { manualLevels = [0, 0, 0, 0, 0]; manualLevels[m] = +$("level").value; }
+  document.querySelectorAll(".motors button").forEach((b) => b.classList.toggle("on", +b.dataset.m === m));
+}
+document.querySelectorAll(".motors button").forEach((b) => { b.onclick = () => setManual(+b.dataset.m); });
+$("level").oninput = () => { $("lvl").textContent = $("level").value; if (manualMotor >= 0) setManual(manualMotor); };
+$("alloff").onclick = () => {
+  setManual(-1);
+  seq = (seq + 1) & 0xffff;
+  bleSend(seq, [0, 0, 0, 0, 0], now());   // one explicit stop; the watchdog would also stop it in 300 ms
+};
+setInterval(() => {
+  if (!manualLevels) return;
+  seq = (seq + 1) & 0xffff;
+  bleSend(seq, manualLevels, now());
+}, 50);
+setInterval(() => {
+  $("sending").textContent = !bleCmd ? "BLE not connected" : lastSent ? lastSent.join(" ") + (manualLevels ? " (manual)" : " (decide)") : "-";
+}, 250);
 
 // ---------- Start ----------
 $("start").onclick = async () => {
