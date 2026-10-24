@@ -5,6 +5,8 @@ import {
   intrinsicsFromFov,
   groundBasis,
   projectToGround,
+  rotatePoints,
+  findHeading,
   lateralHistogram,
   findPeaks,
   estimateHeight,
@@ -21,6 +23,7 @@ export const DEFAULT_CONFIG = {
   maxPoints: 4000,
   band: { xMin: 1, xMax: 4, yHalf: 3, bin: 0.02 },
   peaks: { sigma: 0.03, minSeparation: 0.6, minFraction: 0.2, minCount: 3 },
+  heading: { rangeDeg: 25, stepDeg: 1.5 },
 };
 
 export class GroundLineDetector {
@@ -49,7 +52,8 @@ export class GroundLineDetector {
   }
 
   // rgba: cv.Mat (CV_8UC4) of procWidth x procHeight. upCam: up-vector in camera coords at capture time.
-  process(rgba, upCam) {
+  // headingPrior: lane heading (rad) to search around, e.g. the previous frame's result.
+  process(rgba, upCam, headingPrior = 0) {
     const { cv, cfg } = this;
     cv.cvtColor(rgba, this.rgb, cv.COLOR_RGBA2RGB);
     cv.cvtColor(this.rgb, this.hsv, cv.COLOR_RGB2HSV);
@@ -61,13 +65,16 @@ export class GroundLineDetector {
 
     const count = this.collectMaskPixels();
     const ground = projectToGround(this.pixels, count, this.K, basis, cfg.cameraHeight);
-    const hist = lateralHistogram(ground.points, ground.count, cfg.band);
+    const heading = findHeading(ground.points, ground.count, cfg.band, { ...cfg.heading, center: headingPrior });
+    const aligned = rotatePoints(ground.points, ground.count, heading);
+    const hist = lateralHistogram(aligned, ground.count, cfg.band);
     const peaks = findPeaks(hist, cfg.peaks);
     return {
       ok: true,
       basis,
       maskPixels: count,
       ground,
+      heading,
       hist,
       peaks,
       heightEstimate: estimateHeight(peaks, cfg.cameraHeight),

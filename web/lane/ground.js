@@ -114,6 +114,51 @@ export function groundToPixel(x, y, K, basis, h) {
   return [K.fx * (p[0] / p[2]) + K.cx, K.fy * (p[1] / p[2]) + K.cy];
 }
 
+// Rotates ground points by -theta about the camera foot point, so lines heading at angle theta
+// (radians, positive = lane turns to the right of the camera's forward) become parallel to x.
+// After rotation, y is the perpendicular distance to each line.
+export function rotatePoints(points, count, theta) {
+  const c = Math.cos(theta);
+  const s = Math.sin(theta);
+  const out = new Float32Array(count * 2);
+  for (let i = 0; i < count; i++) {
+    const x = points[2 * i];
+    const y = points[2 * i + 1];
+    out[2 * i] = x * c + y * s;
+    out[2 * i + 1] = -x * s + y * c;
+  }
+  return out;
+}
+
+// Sum of squared bin counts: highest when every line's points fall into as few bins as possible.
+function sharpness(H) {
+  let acc = 0;
+  for (const v of H.hist) acc += v * v;
+  return acc;
+}
+
+// Lane heading in the ground frame: the rotation that makes the lateral histogram sharpest.
+// When the body yaws against the lane, lines are diagonal in the ground frame and their points
+// smear across many bins; rotating them back makes the peaks sharp again.
+// center: search around a prior heading (previous frame or gyro prediction), in radians.
+export function findHeading(points, count, band, { center = 0, rangeDeg = 25, stepDeg = 1.5 } = {}) {
+  const step = (stepDeg * Math.PI) / 180;
+  const n = Math.round(rangeDeg / stepDeg);
+  const scores = [];
+  for (let k = -n; k <= n; k++) {
+    const theta = center + k * step;
+    scores.push(sharpness(lateralHistogram(rotatePoints(points, count, theta), count, band)));
+  }
+  let best = 0;
+  for (let i = 1; i < scores.length; i++) if (scores[i] > scores[best]) best = i;
+  let offset = 0;
+  if (best > 0 && best < scores.length - 1) {
+    const denom = scores[best - 1] - 2 * scores[best] + scores[best + 1];
+    if (denom < 0) offset = (0.5 * (scores[best - 1] - scores[best + 1])) / denom;
+  }
+  return center + (best - n + offset) * step;
+}
+
 // Histogram of the lateral position y of ground points inside a forward band.
 // Track lines are parallel, so in the ground frame each line becomes one sharp peak.
 export function lateralHistogram(points, count, { xMin = 1, xMax = 4, yHalf = 3, bin = 0.02 } = {}) {

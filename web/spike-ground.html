@@ -115,6 +115,7 @@ function run(cv, video) {
   const vctx = view.getContext('2d');
   let lastT = performance.now();
   let fps = 0;
+  let prevHeading = 0;
 
   const frame = () => {
     const cfg = {
@@ -144,8 +145,9 @@ function run(cv, video) {
 
     const t0 = performance.now();
     const rgba = cv.matFromImageData(img);
-    const res = detector.process(rgba, up);
+    const res = detector.process(rgba, up, prevHeading);
     rgba.delete();
+    prevHeading = res.ok && res.peaks.length ? res.heading : 0;
     const procMs = performance.now() - t0;
 
     const now = performance.now();
@@ -171,6 +173,7 @@ function run(cv, video) {
       `fps ${fps.toFixed(1)}   process ${procMs.toFixed(1)} ms   mask px ${res.maskPixels ?? '-'}`,
       `orientation ${lastOrientation ? `β ${lastOrientation.beta.toFixed(1)} γ ${lastOrientation.gamma.toFixed(1)}` : 'none (manual)'}`,
       res.ok ? `peaks (cm) ${res.peaks.map((p) => cm(p.y)).join(' ')}` : `not ok: ${res.reason}`,
+      `lane heading ${res.ok ? ((res.heading * 180) / Math.PI).toFixed(1) + '°' : '-'}  (+ = lane turns right of camera)`,
       `L ${cm(left?.y)}  R ${cm(right?.y)}  lane width ${left && right ? cm(right.y - left.y) : '  -  '}`,
       `jitter 2s (std, cm)  L ${cm(std(jitter.left))}  R ${cm(std(jitter.right))}   target < 10`,
       `h estimate ${res.heightEstimate ? res.heightEstimate.toFixed(2) + ' m' : '-'}`,
@@ -200,11 +203,13 @@ function drawView(ctx, img, detector, res) {
   if (!res.ok) return;
   ctx.strokeStyle = '#3f6';
   ctx.lineWidth = 2;
+  const c = Math.cos(res.heading);
+  const sn = Math.sin(res.heading);
   for (const p of res.peaks) {
     ctx.beginPath();
     let started = false;
-    for (let x = 1; x <= 6; x += 0.25) {
-      const px = groundToPixel(x, p.y, detector.K, res.basis, detector.cfg.cameraHeight);
+    for (let t = 1; t <= 6; t += 0.25) {
+      const px = groundToPixel(t * c - p.y * sn, t * sn + p.y * c, detector.K, res.basis, detector.cfg.cameraHeight);
       if (!px) continue;
       if (started) ctx.lineTo(px[0] * s, px[1] * s);
       else ctx.moveTo(px[0] * s, px[1] * s);
@@ -234,10 +239,13 @@ function drawBev(canvas, res) {
   const { points, count } = res.ground;
   for (let i = 0; i < count; i++) ctx.fillRect(sx(points[2 * i + 1]), sy(points[2 * i]), 1.5, 1.5);
   ctx.strokeStyle = '#3f6';
+  const c = Math.cos(res.heading);
+  const sn = Math.sin(res.heading);
   for (const p of res.peaks) {
     ctx.beginPath();
-    ctx.moveTo(sx(p.y), 0);
-    ctx.lineTo(sx(p.y), H);
+    // Line at perpendicular offset p.y along heading: (x, y) = (t·cos − y'·sin, t·sin + y'·cos).
+    ctx.moveTo(sx(p.y * c), sy(-p.y * sn));
+    ctx.lineTo(sx(6 * sn + p.y * c), sy(6 * c - p.y * sn));
     ctx.stroke();
   }
 }
