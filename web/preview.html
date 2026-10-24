@@ -26,14 +26,24 @@ Page version: <span id="ver"></span></p>
 <script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js"></script>
 <script>
 "use strict";
-const PAGE_VERSION = "preview-1";
+const PAGE_VERSION = "preview-2";
 const ICE_SERVERS = [{ urls: "stun:stun.l.google.com:19302" }];   // keep in sync with record.html
 const $ = (id) => document.getElementById(id);
 $("ver").textContent = PAGE_VERSION;
 function err(msg) { $("errors").textContent = new Date().toLocaleTimeString() + " " + msg + "\n" + $("errors").textContent.slice(0, 500); }
 const status = (t) => { $("status").textContent = t; };
 const video = $("video");
-let peer = null, frames = 0;
+let peer = null, frames = 0, liveTimer = null;
+const DIRECT_TIMEOUT_MS = 10000;
+const HOTSPOT_HINT = "direct link not possible on this network - join the recording phone's Personal Hotspot, then Watch";
+
+// A tiny 1 fps canvas stream: PeerJS needs a stream to start a call; the recorder answers with its camera.
+function dummyStream() {
+  const c = document.createElement("canvas");
+  c.width = c.height = 16;
+  c.getContext("2d").fillRect(0, 0, 16, 16);
+  return c.captureStream(1);
+}
 
 $("go").onclick = () => {
   const code = $("code").value.trim();
@@ -41,24 +51,31 @@ $("go").onclick = () => {
   if (typeof Peer === "undefined") { status("PeerJS not loaded (no internet?)"); return; }
   if (peer) peer.destroy();
   if ("wakeLock" in navigator) navigator.wakeLock.request("screen").catch(() => {});
-  status("connecting...");
+  clearTimeout(liveTimer);
+  status("1/3 connecting to signaling server...");
   peer = new Peer(undefined, { config: { iceServers: ICE_SERVERS } });
   peer.on("open", () => {
-    const conn = peer.connect("hlg-rec-" + code);
-    conn.on("open", () => status("waiting for video..."));
-    conn.on("close", () => status("recording phone stopped sharing"));
-  });
-  // The recording phone calls back with its camera stream.
-  peer.on("call", (call) => {
-    call.answer();
-    call.on("stream", (s) => { video.srcObject = s; video.play().catch(() => {}); status("live"); });
+    status("2/3 calling the recording phone...");
+    const call = peer.call("hlg-rec-" + code, dummyStream());
+    if (!call) { status("call failed - tap Watch to retry"); return; }
+    let live = false;
+    call.on("stream", (s) => {
+      video.srcObject = s;
+      video.play().catch(() => {});
+      live = true;
+      clearTimeout(liveTimer);
+      status("live");
+    });
     call.on("close", () => status("disconnected - tap Watch to retry"));
     const pc = call.peerConnection;
-    pc.addEventListener("connectionstatechange", () => {
-      if (pc.connectionState === "failed") status("connection failed - try the Personal Hotspot, then Watch");
-      if (pc.connectionState === "disconnected") status("connection lost...");
-      if (pc.connectionState === "connected") status("live");
+    if (pc) pc.addEventListener("iceconnectionstatechange", () => {
+      const st = pc.iceConnectionState;
+      if (st === "checking") status("3/3 opening direct link...");
+      if (st === "connected" || st === "completed") status(live ? "live" : "3/3 linked, waiting for video...");
+      if (st === "failed") status(HOTSPOT_HINT);
+      if (st === "disconnected") status("connection lost...");
     });
+    liveTimer = setTimeout(() => { if (!live) status(HOTSPOT_HINT); }, DIRECT_TIMEOUT_MS);
   });
   peer.on("error", (e) => {
     if (e.type === "peer-unavailable") status("code not found - is sharing on?");
