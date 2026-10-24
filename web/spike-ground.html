@@ -364,7 +364,7 @@ function run(cv, video) {
       kf = estimator.update(lane.eY, lane.ePsi, lane.confidence * (staleAttitude ? 0.4 : 1));
     }
     const state = estimator.initialized ? estimator.state : { eY: lane.eY ?? 0, vY: 0, ePsi: lane.ePsi ?? 0 };
-    const cmd = controller.step(state, lane.status, lane.curvature ?? 0, performance.now());
+    const cmd = controller.step(state, lane.status, lane.curvature ?? 0, performance.now(), !!lane.lowConfidence);
     // The belt only vibrates in belt runs; it still gets all-zero commands otherwise, so the board keeps a live link.
     const condition = $('condition').value;
     const levels = commandToLevels(cmd);

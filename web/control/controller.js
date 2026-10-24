@@ -99,7 +99,8 @@ export class HapticController {
 
   // state: LaneEstimator.state; status: LaneTracker status; curvature: LaneTracker curvature (1/m).
   // tMs: frame time (ms); when given, eY and ePsi are averaged as described in the config.
-  step(state, status, curvature = 0, tMs = null) {
+  // lowConfidence (just re-locked): the cue stays at most in the small-turn zone.
+  step(state, status, curvature = 0, tMs = null, lowConfidence = false) {
     const c = this.cfg;
     if (status === LaneStatus.UNLOCKED || status === LaneStatus.LOST) this.reset();
     if (status === LaneStatus.UNLOCKED) {
@@ -130,6 +131,7 @@ export class HapticController {
     } else {
       this.zone = nextZone(this.zone, mag, c);
     }
+    if (lowConfidence) this.zone = Math.min(this.zone, 1);
 
     if (this.zone === 0) {
       return {
