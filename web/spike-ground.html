@@ -1,0 +1,266 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Ground Spike</title>
+<style>
+  body { margin: 0; padding: 12px; font: 13px/1.4 -apple-system, system-ui, sans-serif; background: #111; color: #eee; }
+  button { font-size: 18px; padding: 14px 20px; width: 100%; border-radius: 10px; border: 0; background: #2d7; color: #000; }
+  .row { display: flex; flex-wrap: wrap; gap: 8px; margin: 8px 0; }
+  canvas { background: #000; max-width: 100%; }
+  label { display: flex; gap: 4px; align-items: center; }
+  input[type=number] { width: 64px; }
+  #stats { white-space: pre; font-family: ui-monospace, monospace; }
+  #log { white-space: pre-wrap; font-family: ui-monospace, monospace; color: #f88; max-height: 140px; overflow: auto; }
+  video { display: none; }
+</style>
+</head>
+<body>
+<button id="start">Start (camera + motion)</button>
+<div class="row">
+  <canvas id="view"></canvas>
+  <canvas id="bev" width="240" height="320"></canvas>
+</div>
+<canvas id="hist" width="480" height="80"></canvas>
+<div id="stats">loading OpenCV…</div>
+<div class="row">
+  <label>h(m) <input id="h" type="number" step="0.05" value="1.3"></label>
+  <label>hfov <input id="hfov" type="number" step="1" value="53"></label>
+  <label>Vmin <input id="vmin" type="number" step="5" value="180"></label>
+  <label>Smax <input id="smax" type="number" step="5" value="60"></label>
+  <label>lag(ms) <input id="lag" type="number" step="10" value="50"></label>
+</div>
+<div class="row">
+  <label>manual β <input id="mbeta" type="number" step="1" value="65"></label>
+  <label>manual γ <input id="mgamma" type="number" step="1" value="0"></label>
+  <span>(used only when the device sends no orientation, e.g. a laptop webcam)</span>
+</div>
+<div id="log"></div>
+<video id="video" playsinline muted></video>
+<canvas id="proc" hidden></canvas>
+
+<script async src="https://docs.opencv.org/4.10.0/opencv.js"></script>
+<script type="module">
+import { GroundLineDetector, DEFAULT_CONFIG } from './lane/detector.js';
+import { AttitudeBuffer, upFromOrientation, deviceToCamera, groundToPixel } from './lane/ground.js';
+
+const $ = (id) => document.getElementById(id);
+const logEl = $('log');
+const log = (msg) => { logEl.textContent = `${new Date().toLocaleTimeString()} ${msg}\n` + logEl.textContent; };
+window.addEventListener('error', (e) => log(`error: ${e.message}`));
+window.addEventListener('unhandledrejection', (e) => log(`rejection: ${e.reason}`));
+
+async function loadCv() {
+  while (!window.cv) await new Promise((r) => setTimeout(r, 50));
+  let cv = window.cv;
+  if (cv instanceof Promise) cv = await cv;
+  if (!cv.Mat) await new Promise((r) => { cv.onRuntimeInitialized = r; });
+  return cv;
+}
+
+const attitude = new AttitudeBuffer();
+let lastOrientation = null;
+window.addEventListener('deviceorientation', (e) => {
+  if (e.beta == null) return;
+  lastOrientation = { beta: e.beta, gamma: e.gamma };
+  attitude.push(performance.now(), deviceToCamera(upFromOrientation(e.beta, e.gamma)));
+});
+
+const jitter = { left: [], right: [] };
+function pushJitter(key, v) {
+  const a = jitter[key];
+  a.push(v);
+  if (a.length > 60) a.shift();
+}
+const std = (a) => {
+  if (a.length < 5) return NaN;
+  const m = a.reduce((s, v) => s + v, 0) / a.length;
+  return Math.sqrt(a.reduce((s, v) => s + (v - m) ** 2, 0) / a.length);
+};
+
+$('start').onclick = async () => {
+  try {
+    if (typeof DeviceOrientationEvent !== 'undefined' && DeviceOrientationEvent.requestPermission) {
+      log(`orientation permission: ${await DeviceOrientationEvent.requestPermission()}`);
+    }
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: 'environment', width: { ideal: 640 }, height: { ideal: 480 } },
+      audio: false,
+    });
+    const video = $('video');
+    video.srcObject = stream;
+    await video.play();
+    const cv = await loadCv();
+    $('start').hidden = true;
+    run(cv, video);
+  } catch (err) {
+    log(`start failed: ${err.name || ''} ${err.message || err}`);
+  }
+};
+
+function run(cv, video) {
+  const procWidth = DEFAULT_CONFIG.procWidth;
+  const procHeight = Math.round((procWidth * video.videoHeight) / video.videoWidth);
+  log(`video ${video.videoWidth}x${video.videoHeight} -> proc ${procWidth}x${procHeight}`);
+  let detector = null;
+  let detectorKey = '';
+  const proc = $('proc');
+  proc.width = procWidth;
+  proc.height = procHeight;
+  const pctx = proc.getContext('2d', { willReadFrequently: true });
+  const view = $('view');
+  view.width = procWidth * 2;
+  view.height = procHeight * 2;
+  const vctx = view.getContext('2d');
+  let lastT = performance.now();
+  let fps = 0;
+
+  const frame = () => {
+    const cfg = {
+      procWidth,
+      procHeight,
+      cameraHeight: +$('h').value,
+      hfovDeg: +$('hfov').value,
+      whiteVMin: +$('vmin').value,
+      whiteSMax: +$('smax').value,
+    };
+    const key = `${cfg.hfovDeg}|${cfg.cameraHeight}`;
+    if (key !== detectorKey) {
+      detector?.delete();
+      detector = new GroundLineDetector(cv, cfg);
+      detectorKey = key;
+    }
+    if (cfg.whiteVMin !== detector.cfg.whiteVMin || cfg.whiteSMax !== detector.cfg.whiteSMax) {
+      detector.setThresholds(cfg.whiteVMin, cfg.whiteSMax);
+    }
+
+    const tCapture = performance.now() - +$('lag').value;
+    pctx.drawImage(video, 0, 0, procWidth, procHeight);
+    const img = pctx.getImageData(0, 0, procWidth, procHeight);
+    const up = lastOrientation
+      ? attitude.at(tCapture)
+      : deviceToCamera(upFromOrientation(+$('mbeta').value, +$('mgamma').value));
+
+    const t0 = performance.now();
+    const rgba = cv.matFromImageData(img);
+    const res = detector.process(rgba, up);
+    rgba.delete();
+    const procMs = performance.now() - t0;
+
+    const now = performance.now();
+    fps = 0.9 * fps + 0.1 * (1000 / (now - lastT));
+    lastT = now;
+
+    drawView(vctx, img, detector, res);
+    drawBev($('bev'), res);
+    drawHist($('hist'), res);
+
+    let left = null;
+    let right = null;
+    if (res.ok) {
+      for (const p of res.peaks) {
+        if (p.y < 0) left = p;
+        else if (!right) right = p;
+      }
+      if (left) pushJitter('left', left.y);
+      if (right) pushJitter('right', right.y);
+    }
+    const cm = (v) => (v == null || Number.isNaN(v) ? '  -  ' : (v * 100).toFixed(1).padStart(6));
+    $('stats').textContent = [
+      `fps ${fps.toFixed(1)}   process ${procMs.toFixed(1)} ms   mask px ${res.maskPixels ?? '-'}`,
+      `orientation ${lastOrientation ? `β ${lastOrientation.beta.toFixed(1)} γ ${lastOrientation.gamma.toFixed(1)}` : 'none (manual)'}`,
+      res.ok ? `peaks (cm) ${res.peaks.map((p) => cm(p.y)).join(' ')}` : `not ok: ${res.reason}`,
+      `L ${cm(left?.y)}  R ${cm(right?.y)}  lane width ${left && right ? cm(right.y - left.y) : '  -  '}`,
+      `jitter 2s (std, cm)  L ${cm(std(jitter.left))}  R ${cm(std(jitter.right))}   target < 10`,
+      `h estimate ${res.heightEstimate ? res.heightEstimate.toFixed(2) + ' m' : '-'}`,
+    ].join('\n');
+
+    if (video.requestVideoFrameCallback) video.requestVideoFrameCallback(frame);
+    else requestAnimationFrame(frame);
+  };
+  frame();
+}
+
+function drawView(ctx, img, detector, res) {
+  const s = 2;
+  const tmp = new OffscreenCanvas(img.width, img.height);
+  const tctx = tmp.getContext('2d');
+  const mask = detector.mask.data;
+  for (let i = 0; i < mask.length; i++) {
+    if (mask[i]) {
+      img.data[4 * i] = 255;
+      img.data[4 * i + 1] = 40;
+      img.data[4 * i + 2] = 40;
+    }
+  }
+  tctx.putImageData(img, 0, 0);
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(tmp, 0, 0, img.width * s, img.height * s);
+  if (!res.ok) return;
+  ctx.strokeStyle = '#3f6';
+  ctx.lineWidth = 2;
+  for (const p of res.peaks) {
+    ctx.beginPath();
+    let started = false;
+    for (let x = 1; x <= 6; x += 0.25) {
+      const px = groundToPixel(x, p.y, detector.K, res.basis, detector.cfg.cameraHeight);
+      if (!px) continue;
+      if (started) ctx.lineTo(px[0] * s, px[1] * s);
+      else ctx.moveTo(px[0] * s, px[1] * s);
+      started = true;
+    }
+    ctx.stroke();
+  }
+}
+
+// Bird's-eye view: forward 0..5m bottom to top, lateral -3..3m.
+function drawBev(canvas, res) {
+  const ctx = canvas.getContext('2d');
+  const W = canvas.width;
+  const H = canvas.height;
+  const sx = (y) => W / 2 + (y / 3) * (W / 2);
+  const sy = (x) => H - (x / 5) * H;
+  ctx.fillStyle = '#000';
+  ctx.fillRect(0, 0, W, H);
+  ctx.fillStyle = '#333';
+  ctx.fillRect(0, sy(4), W, sy(1) - sy(4));
+  ctx.fillStyle = '#fff';
+  ctx.beginPath();
+  ctx.arc(sx(0), sy(0) - 4, 4, 0, 2 * Math.PI);
+  ctx.fill();
+  if (!res.ok) return;
+  ctx.fillStyle = '#f55';
+  const { points, count } = res.ground;
+  for (let i = 0; i < count; i++) ctx.fillRect(sx(points[2 * i + 1]), sy(points[2 * i]), 1.5, 1.5);
+  ctx.strokeStyle = '#3f6';
+  for (const p of res.peaks) {
+    ctx.beginPath();
+    ctx.moveTo(sx(p.y), 0);
+    ctx.lineTo(sx(p.y), H);
+    ctx.stroke();
+  }
+}
+
+function drawHist(canvas, res) {
+  const ctx = canvas.getContext('2d');
+  ctx.fillStyle = '#000';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  if (!res.ok) return;
+  const h = res.hist.hist;
+  let max = 1;
+  for (const v of h) max = Math.max(max, v);
+  ctx.fillStyle = '#f55';
+  const bw = canvas.width / h.length;
+  for (let i = 0; i < h.length; i++) {
+    const bh = (h[i] / max) * canvas.height;
+    ctx.fillRect(i * bw, canvas.height - bh, Math.max(1, bw), bh);
+  }
+  ctx.fillStyle = '#fff';
+  ctx.fillRect(canvas.width / 2, 0, 1, canvas.height);
+}
+
+loadCv().then(() => { if (!$('start').hidden) $('stats').textContent = 'OpenCV ready. Tap Start.'; });
+</script>
+</body>
+</html>

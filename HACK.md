@@ -48,7 +48,7 @@ Proof for judges: lateral-error RMS (cm) on the same lane with (a) no feedback, 
 - Lane-change and track-curve handling beyond gentle curves: demo straight + slight curve only.
 - Night / rain / any lighting robustness beyond the demo conditions.
 - Google Maps / GPS: GPS error is meters, a lane is 1.22m; useless for lane keeping.
-- LLM (Gemini/Claude/Grok) inside the control loop: second-scale latency vs a 30Hz loop. Slow-loop use (scene check, post-run voice summary) only if a Microsoft/Meta track requires it, after the core loop works.
+- All AI APIs (Gemini/Claude/Grok), in or out of the control loop: cut from the MVP (team decision, Sat). Revisit only if a track requires it after the core loop works.
 - Camera EIS (preferredVideoStabilizationMode): adds latency and breaks camera-IMU geometry; we stabilize the error signal with IMU + Kalman instead.
 - ML lane model (UFLD / custom YOLO-seg): only if classic CV fails on the demo track.
 - Pivot to crosswalks / general walking: bigger story, more scope; one line in the pitch as "next".
@@ -93,3 +93,5 @@ Mocked, hardcoded, or seeded parts we will disclose in the demo:
 - 18:30 Fri Re-scoped MVP: live walk on self-built demo track + RMS proof chart; cut Maps, in-loop LLM, EIS, ML lane model, pivot. ~40h to provisional deadline. Next: /hack-stack.
 - 19:30 Fri Stack chosen: Swift/iPhone (AVFoundation + CoreMotion + CoreBluetooth) -> UNO R4 WiFi (ArduinoBLE) -> ULN2003 -> ERM motors. No API keys in MVP. Next: spike e_y stability (vision) and BLE->motor latency (hardware) in parallel.
 - 20:00 Fri Moved HACK.md to new repo haptic-lane-guide. No Mac -> replaced native iOS app with iPhone Safari sensor page -> Ubuntu Python/OpenCV server -> UDP -> UNO R4 WiFi; home-made ERM motors (DC motor + printed mass) via MOSFETs. Next: spike end-to-end latency + e_y jitter, and motor spin-up time.
+- Sat BLE image + IMU transfer working. Design: phone runs OpenCV; IMU gravity -> per-frame ground projection; white-pixel lateral histogram in ground frame finds parallel lines; lane LOCK at start keeps the two lines around the runner by Kalman tracking (lane identity by continuity, not re-detection); centerline = mid of L/R (or one line +/- 0.61m). Motors 1/5 = big turn, 2/4 = small turn, 3 = straight heartbeat; R4 runs pulse timing + 300ms watchdog. BLE carries motor commands only. AI APIs cut. Step 1 started: OpenCV.js ground projection + lateral histogram peaks (web/).
+- Sat Step 1 code done: web/lane/ground.js (geometry, 8 node tests pass), web/lane/detector.js (OpenCV.js mask -> peaks; synthetic frames at 3 poses recover lines within 0.2cm), web/spike-ground.html (phone spike page with jitter readout). Finding: portrait 1x camera (~53 deg) sees only the runner's own two lines up close (+-0.7m at 1m); outer lanes only beyond ~3m. Next: real-phone jitter test on taped lane, then lane lock + tracking.

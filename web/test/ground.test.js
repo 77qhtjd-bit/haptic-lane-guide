@@ -1,0 +1,107 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {
+  intrinsicsFromFov,
+  upFromOrientation,
+  deviceToCamera,
+  AttitudeBuffer,
+  groundBasis,
+  projectToGround,
+  groundToPixel,
+  lateralHistogram,
+  findPeaks,
+  estimateHeight,
+} from '../lane/ground.js';
+
+const K = intrinsicsFromFov(120, 160, 53);
+const close = (a, b, tol) => assert.ok(Math.abs(a - b) <= tol, `${a} not within ${tol} of ${b}`);
+
+// Renders painted lines (5cm wide) into quantized pixel centers, like a real low-res mask would.
+function renderLines(lineYs, basis, h) {
+  const seen = new Set();
+  const pixels = [];
+  for (const yc of lineYs) {
+    for (let x = 0.5; x <= 6; x += 0.004) {
+      for (let dy = -0.025; dy <= 0.025; dy += 0.005) {
+        const p = groundToPixel(x, yc + dy, K, basis, h);
+        if (!p || p[0] < 0 || p[0] >= K.width || p[1] < 0 || p[1] >= K.height) continue;
+        const key = `${Math.floor(p[0])},${Math.floor(p[1])}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        pixels.push(Math.floor(p[0]) + 0.5, Math.floor(p[1]) + 0.5);
+      }
+    }
+  }
+  return { pixels: Float32Array.from(pixels), count: pixels.length / 2 };
+}
+
+function detect(lineYs, { beta = 65, gamma = 4, hTrue = 1.3, hAssumed = 1.3 } = {}) {
+  const basis = groundBasis(deviceToCamera(upFromOrientation(beta, gamma)));
+  const { pixels, count } = renderLines(lineYs, basis, hTrue);
+  const ground = projectToGround(pixels, count, K, basis, hAssumed);
+  return findPeaks(lateralHistogram(ground.points, ground.count));
+}
+
+test('orientation gives up-vectors for flat and upright phones', () => {
+  assert.deepEqual(upFromOrientation(0, 0).map((v) => +v.toFixed(6)), [0, 0, 1]);
+  assert.deepEqual(upFromOrientation(90, 0).map((v) => +v.toFixed(6)), [0, 1, 0]);
+  // Upright portrait phone: up points toward the top of the image (-y in camera coords).
+  close(deviceToCamera(upFromOrientation(90, 0))[1], -1, 1e-9);
+});
+
+test('camera conventions: ahead is below center when tilted down, right is right', () => {
+  const basis = groundBasis(deviceToCamera(upFromOrientation(65, 0)));
+  const ahead = groundToPixel(2, 0, K, basis, 1.3);
+  close(ahead[0], K.cx, 1e-6);
+  assert.ok(ahead[1] > K.cy);
+  assert.ok(groundToPixel(2, 0.5, K, basis, 1.3)[0] > K.cx);
+});
+
+test('projection round-trips through groundToPixel', () => {
+  const basis = groundBasis(deviceToCamera(upFromOrientation(70, -6)));
+  const p = groundToPixel(2.7, -0.4, K, basis, 1.25);
+  const g = projectToGround(Float32Array.from(p), 1, K, basis, 1.25);
+  close(g.points[0], 2.7, 1e-4);
+  close(g.points[1], -0.4, 1e-4);
+});
+
+test('camera pointing straight down has no forward direction', () => {
+  assert.equal(groundBasis([0, 0, -1]), null);
+});
+
+// A portrait 1x camera (~53 deg) on the chest sees about +-0.7m at 1m and +-2m at 4m ahead, so the
+// two lines of the runner's own lane are always in view; lines one lane further out only appear far
+// away. Those must be accurate if reported, but they are not required.
+function assertLines(peaks, required, optional, tol) {
+  for (const y of required) {
+    assert.ok(peaks.some((p) => Math.abs(p.y - y) <= tol), `missing line at ${y}: ${JSON.stringify(peaks)}`);
+  }
+  for (const p of peaks) {
+    assert.ok([...required, ...optional].some((y) => Math.abs(p.y - y) <= tol), `spurious peak ${p.y}`);
+  }
+}
+
+test("finds the runner's two lane lines within 2cm, runner centered", () => {
+  assertLines(detect([-1.83, -0.61, 0.61, 1.83]), [-0.61, 0.61], [-1.83, 1.83], 0.02);
+});
+
+test('lane lines stay put when the body pitches and rolls (running shake)', () => {
+  for (const [beta, gamma] of [[55, -8], [65, 0], [75, 8]]) {
+    assertLines(detect([-2.17, -0.95, 0.27, 1.49], { beta, gamma }), [-0.95, 0.27], [-2.17, 1.49], 0.03);
+  }
+});
+
+test('lane width re-estimates a wrong camera height', () => {
+  const peaks = detect([-1.83, -0.61, 0.61, 1.83], { hTrue: 1.3, hAssumed: 1.1 });
+  close(estimateHeight(peaks, 1.1), 1.3, 0.03);
+});
+
+test('attitude buffer interpolates between samples', () => {
+  const buf = new AttitudeBuffer();
+  buf.push(0, [0, -1, 0]);
+  buf.push(10, [0, 0, -1]);
+  const mid = buf.at(5);
+  close(mid[1], -Math.SQRT1_2, 1e-9);
+  close(mid[2], -Math.SQRT1_2, 1e-9);
+  assert.deepEqual(buf.at(-5), [0, -1, 0]);
+});
