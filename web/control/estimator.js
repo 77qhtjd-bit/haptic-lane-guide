@@ -13,6 +13,7 @@ export const DEFAULT_ESTIMATOR_CONFIG = {
   rY: 0.04 ** 2, // m^2: vision noise on eY at confidence 1
   rPsi: (2 * DEG) ** 2, // rad^2: vision noise on ePsi at confidence 1
   gateChi2: 9.21, // 99% for 2 dof: innovations beyond this are rejected as outliers
+  maxRejects: 5, // this many outliers in a row means the filter, not vision, is wrong: re-initialize
   maxDt: 0.2, // s: longer gaps (app paused) are clamped
 };
 
@@ -38,6 +39,7 @@ export class LaneEstimator {
     this.x = [eY, 0, ePsi];
     this.P = diag(this.cfg.rY, 0.25, this.cfg.rPsi);
     this.initialized = true;
+    this.rejects = 0;
   }
 
   // yawRate: rad/s about the world vertical, + = turning left (see yawRateFromMotion).
@@ -61,7 +63,7 @@ export class LaneEstimator {
   }
 
   // Measurement z = [eY, ePsi] from the lane tracker; noise grows as confidence drops.
-  // Returns { accepted, nis } (nis = normalized innovation squared, for tuning).
+  // Returns { accepted, nis, reset } (nis = normalized innovation squared, for tuning).
   update(eY, ePsi, confidence = 1) {
     if (!this.initialized) {
       this.reset(eY, ePsi);
@@ -80,7 +82,14 @@ export class LaneEstimator {
     const i01 = -s01 / det;
     const i11 = s00 / det;
     const nis = y0 * (i00 * y0 + i01 * y1) + y1 * (i01 * y0 + i11 * y1);
-    if (nis > this.cfg.gateChi2) return { accepted: false, nis };
+    if (nis > this.cfg.gateChi2) {
+      // A one-off jump (wrong line matched) is dropped; a persistent one would otherwise lock the
+      // filter onto a stale state forever (seen after big real jumps or an IMU stall).
+      if (++this.rejects < this.cfg.maxRejects) return { accepted: false, nis };
+      this.reset(eY, ePsi);
+      return { accepted: true, nis, reset: true };
+    }
+    this.rejects = 0;
 
     // K = P H^T S^-1 (3x2)
     const K = [0, 1, 2].map((r) => {

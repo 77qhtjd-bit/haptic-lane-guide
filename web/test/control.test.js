@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { LaneEstimator, yawRateFromMotion } from '../control/estimator.js';
 import { HapticController, Pattern, motorBit } from '../control/controller.js';
-import { encodeCommand } from '../control/protocol.js';
+import { commandToLevels, encodeLevels, levelForPeriod } from '../control/protocol.js';
 import { LaneStatus } from '../lane/tracker.js';
 
 const DEG = Math.PI / 180;
@@ -59,6 +59,23 @@ test('estimator rejects a one-frame outlier (wrong line matched)', () => {
   const res = est.update(0.6, 0, 1);
   assert.equal(res.accepted, false);
   close(est.state.eY, 0, 0.01);
+});
+
+test('estimator re-initializes when the jump persists instead of locking onto a stale state', () => {
+  const est = new LaneEstimator();
+  est.reset(0.5, 0);
+  for (let i = 0; i < 30; i++) {
+    est.predict(1 / 30, 0);
+    est.update(0.5, 0, 1);
+  }
+  let res;
+  for (let i = 0; i < 5; i++) {
+    est.predict(1 / 30, 0);
+    res = est.update(-0.2, 0, 1);
+  }
+  assert.equal(res.reset, true);
+  close(est.state.eY, -0.2, 1e-9);
+  close(est.state.vY, 0, 1e-9);
 });
 
 test('gyro keeps heading moving between frames, with the right sign', () => {
@@ -119,10 +136,23 @@ test('controller: outside the lane always gives the strongest cue back, lost giv
   assert.equal(ctl.step({ eY: 0 }, LaneStatus.UNLOCKED).pattern, Pattern.OFF);
 });
 
-test('packet layout matches the firmware', () => {
-  const packet = encodeCommand(
-    { pattern: Pattern.STEER, motors: motorBit(2), level: 170, periodMs: 420 },
-    { eY: -0.234, ePsi: 7 * DEG, status: LaneStatus.INSIDE },
-  );
-  assert.deepEqual([...packet], [1, 1, 0b00010, 170, 42, (-23) & 0xff, 7, 1]);
+test('levels match the lane_actuator_ble firmware pulse mapping', () => {
+  // Firmware: periodFor(level) = 1000 - (level - 1) * 880 / 253.
+  const periodFor = (lv) => 1000 - Math.floor(((lv - 1) * 880) / 253);
+  for (const period of [1000, 600, 420, 150, 120]) close(periodFor(levelForPeriod(period)), period, 4);
+  assert.equal(levelForPeriod(5000), 1);
+  assert.equal(levelForPeriod(10), 254);
+});
+
+test('commands become per-motor levels: one motor, both outer motors for stop, zeros for off', () => {
+  const ctl = new HapticController();
+  const steer = commandToLevels(ctl.step({ eY: 0.2 }, LaneStatus.INSIDE));
+  assert.deepEqual(steer.map((l) => l > 0), [false, true, false, false, false]);
+  assert.deepEqual(commandToLevels(ctl.step({ eY: 0 }, LaneStatus.INSIDE)), [0, 0, 1, 0, 0]); // heartbeat = slowest pulse
+  assert.deepEqual(commandToLevels(ctl.step({ eY: 0 }, LaneStatus.LOST)), [254, 0, 0, 0, 254]);
+  assert.deepEqual(commandToLevels(ctl.step({ eY: 0 }, LaneStatus.UNLOCKED)), [0, 0, 0, 0, 0]);
+});
+
+test('packet layout matches the firmware: [seq lo, seq hi, L1..L5]', () => {
+  assert.deepEqual([...encodeLevels(0x1234, [0, 116, 0, 0, 300])], [0x34, 0x12, 0, 116, 0, 0, 255]);
 });

@@ -22,14 +22,39 @@
   #motors { display: flex; gap: 6px; margin: 8px 0; }
   #motors div { flex: 1; text-align: center; padding: 10px 0; border-radius: 8px; background: #333; font-weight: 700; }
   #motors div.on { background: #fc3; color: #000; }
+  #runs { border: 1px solid #444; border-radius: 10px; padding: 8px; margin: 8px 0; }
+  #runs select, #runs button { font-size: 16px; padding: 10px; }
+  #runs button { width: auto; flex: 1; }
+  #runTable { width: 100%; border-collapse: collapse; font-family: ui-monospace, monospace; }
+  #runTable td, #runTable th { border-bottom: 1px solid #333; padding: 2px 4px; text-align: right; }
+  #csvOut { width: 100%; height: 120px; font-family: ui-monospace, monospace; font-size: 11px; }
 </style>
 </head>
 <body>
 <button id="start">Start (camera + motion)</button>
 <button id="lock" hidden>Lock lane</button>
-<button id="connect">Connect belt (BLE)</button>
+<button id="connect">Connect belt (BLE: LaneActuator)</button>
+<label><input type="checkbox" id="sim"> Simulate lane: tilt the phone left/right = drift left/right (no lane needed)</label>
 <div id="status"></div>
 <div id="motors"><div>1</div><div>2</div><div>3</div><div>4</div><div>5</div></div>
+<div id="runs">
+  <div class="row">
+    <select id="condition">
+      <option value="belt">belt</option>
+      <option value="audio">audio</option>
+      <option value="none">no feedback</option>
+    </select>
+    <button id="runBtn">Start run</button>
+  </div>
+  <table id="runTable"></table>
+  <div class="row">
+    <button id="csvDownload">Download CSV</button>
+    <button id="csvCopy">Copy CSV</button>
+    <button id="csvShow">Show CSV</button>
+    <button id="runsClear">Clear runs</button>
+  </div>
+  <textarea id="csvOut" hidden readonly></textarea>
+</div>
 <div class="row">
   <canvas id="view"></canvas>
   <canvas id="bev" width="240" height="320"></canvas>
@@ -55,11 +80,13 @@
 <script async src="./vendor/opencv.js"></script>
 <script type="module">
 import { GroundLineDetector, DEFAULT_CONFIG } from './lane/detector.js';
-import { AttitudeBuffer, upFromOrientation, deviceToCamera, groundToPixel } from './lane/ground.js';
+import { AttitudeBuffer, upFromOrientation, deviceToCamera, groundToPixel, LANE_WIDTH_M } from './lane/ground.js';
 import { LaneTracker, LaneStatus } from './lane/tracker.js';
 import { LaneEstimator, yawRateFromMotion } from './control/estimator.js';
 import { HapticController, Pattern } from './control/controller.js';
-import { BeltLink, encodeCommand } from './control/protocol.js';
+import { BeltLink, commandToLevels } from './control/protocol.js';
+import { RunLogger, Condition } from './control/logger.js';
+import { AudioCue } from './control/audio.js';
 
 const $ = (id) => document.getElementById(id);
 const logEl = $('log');
@@ -88,30 +115,106 @@ let lastOrientation = null;
 let upDevice = null;
 window.addEventListener('deviceorientation', (e) => {
   if (e.beta == null) return;
-  lastOrientation = { beta: e.beta, gamma: e.gamma };
+  lastOrientation = { beta: e.beta, gamma: e.gamma, t: performance.now() };
   upDevice = upFromOrientation(e.beta, e.gamma);
   attitude.push(performance.now(), deviceToCamera(upDevice));
 });
 
 // Kalman prediction runs on every IMU sample; vision updates arrive per frame.
+// iOS sometimes stops delivering motion events for up to ~2 s while the camera runs (measured in
+// docs/phone-pipeline.md). When the IMU is older than IMU_STALE_MS, the frame loop predicts instead
+// (without yaw rate), and vision measured with the stale attitude counts for less.
+const IMU_STALE_MS = 100;
 const estimator = new LaneEstimator();
 const controller = new HapticController();
-let lastMotionT = null;
+let lastMotionT = -Infinity;
+let lastPredictT = null;
 let yawRate = 0;
+function predictTo(t, rate) {
+  if (lastPredictT !== null && t > lastPredictT) estimator.predict((t - lastPredictT) / 1000, rate);
+  lastPredictT = t;
+}
 window.addEventListener('devicemotion', (e) => {
   const t = performance.now();
-  if (e.rotationRate && upDevice) {
-    yawRate = yawRateFromMotion(e.rotationRate, upDevice);
-    if (lastMotionT !== null) estimator.predict((t - lastMotionT) / 1000, yawRate);
-  }
+  if (!e.rotationRate || !upDevice) return;
+  yawRate = yawRateFromMotion(e.rotationRate, upDevice);
   lastMotionT = t;
+  predictTo(t, yawRate);
 });
 
-const belt = new BeltLink({ onLog: (m) => log(m) });
+const belt = new BeltLink({
+  onLog: (m) => log(m),
+  onStatus: (text, ok) => {
+    $('connect').textContent = text;
+    $('connect').style.background = ok ? '#2d7' : '#39f';
+  },
+});
+if (navigator.bluetooth) belt.restore().catch((err) => log(`belt restore: ${err.message || err}`));
+else $('connect').textContent = 'No Web Bluetooth (open in Bluefy)';
+const audioCue = new AudioCue();
+
+// Runs for the proof chart: same lane, walked under each condition; compare RMS of eY.
+const logger = new RunLogger();
+const cm1 = (m) => (Number.isFinite(m) ? (m * 100).toFixed(1) : '-');
+function renderRuns() {
+  const head = '<tr><th>#</th><th>cond</th><th>s</th><th>RMS cm</th><th>max cm</th><th>inside %</th><th>tracked %</th></tr>';
+  $('runTable').innerHTML = head + logger.runs.map((r, i) => {
+    const s = r.summary;
+    return `<tr><td>${i + 1}</td><td>${r.condition}</td><td>${s.durationS.toFixed(0)}</td><td>${cm1(s.rmsEyKf)}</td>` +
+      `<td>${cm1(s.maxAbsEy)}</td><td>${s.insidePct.toFixed(0)}</td><td>${s.trackedPct.toFixed(0)}</td></tr>`;
+  }).join('');
+}
+renderRuns();
+$('runBtn').onclick = () => {
+  if (logger.recording) {
+    const run = logger.stop();
+    $('runBtn').textContent = 'Start run';
+    $('condition').disabled = false;
+    log(run ? `run saved: ${run.condition}, RMS ${cm1(run.summary.rmsEyKf)} cm` : 'run had no frames');
+    renderRuns();
+  } else {
+    logger.start($('condition').value);
+    $('runBtn').textContent = 'Stop run';
+    $('condition').disabled = true;
+  }
+};
+// Downloads may be blocked inside some iOS browsers, so copy and show are there as fallbacks.
+$('csvDownload').onclick = () => {
+  const url = URL.createObjectURL(new Blob([logger.toCsv()], { type: 'text/csv' }));
+  const a = Object.assign(document.createElement('a'), { href: url, download: `lane-runs-${Date.now()}.csv` });
+  document.body.append(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+};
+$('csvCopy').onclick = async () => {
+  try {
+    await navigator.clipboard.writeText(logger.toCsv());
+    log('CSV copied');
+  } catch (err) {
+    log(`copy failed (${err.message || err}); use Show CSV`);
+  }
+};
+$('csvShow').onclick = () => {
+  $('csvOut').hidden = !$('csvOut').hidden;
+  $('csvOut').value = logger.toCsv();
+};
+let clearArmed = false;
+$('runsClear').onclick = () => {
+  if (!clearArmed) {
+    clearArmed = true;
+    $('runsClear').textContent = 'Tap again to clear';
+    setTimeout(() => { clearArmed = false; $('runsClear').textContent = 'Clear runs'; }, 3000);
+    return;
+  }
+  logger.clear();
+  renderRuns();
+  clearArmed = false;
+  $('runsClear').textContent = 'Clear runs';
+};
 $('connect').onclick = async () => {
   try {
-    await belt.connect();
-    $('connect').textContent = 'Belt connected';
+    await belt.choose();
   } catch (err) {
     log(`belt connect failed: ${err.name || ''} ${err.message || err}`);
   }
@@ -131,6 +234,7 @@ const std = (a) => {
 
 $('start').onclick = async () => {
   try {
+    audioCue.start(); // must happen inside the tap, before any await
     if (typeof DeviceOrientationEvent !== 'undefined' && DeviceOrientationEvent.requestPermission) {
       log(`orientation permission: ${await DeviceOrientationEvent.requestPermission()}`);
     }
@@ -177,6 +281,7 @@ function run(cv, video) {
     if (ok) {
       controller.zone = 0;
       estimator.reset(tracker.last.eY, tracker.last.ePsi);
+      lastPredictT = performance.now();
     }
     log(ok ? `locked: width ${(tracker.width * 100).toFixed(0)} cm` : 'lock failed: need one line on each side, ~122 cm apart');
   };
@@ -212,7 +317,9 @@ function run(cv, video) {
     const res = detector.process(rgba, up, prevHeading);
     rgba.delete();
     latest = res;
-    const lane = tracker.update(res.ok ? res.peaks : [], res.ok ? res.heading : tracker.heading);
+    const lane = $('sim').checked
+      ? simulatedLane(upDevice ? rollDeg(upDevice) : +$('mgamma').value)
+      : tracker.update(res.ok ? res.peaks : [], res.ok ? res.heading : tracker.heading);
     // Once locked, the lane's own heading is the better prior than whatever the last frame found.
     if (tracker.locked && lane.status !== LaneStatus.LOST) prevHeading = lane.heading;
     else prevHeading = res.ok && res.peaks.length ? res.heading : 0;
@@ -221,20 +328,43 @@ function run(cv, video) {
       : `${lane.status}   eY ${(lane.eY * 100).toFixed(0)} cm   eψ ${((lane.ePsi * 180) / Math.PI).toFixed(1)}°`;
     $('status').className = lane.status;
 
-    // Without a gyro (laptop webcam) the filter still runs, just without the IMU prediction.
-    if (!upDevice && estimator.initialized) {
-      const t = performance.now();
-      if (lastMotionT !== null) estimator.predict((t - lastMotionT) / 1000, 0);
-      lastMotionT = t;
-    }
+    // IMU stalled (or no gyro at all, e.g. a laptop webcam): keep the filter moving from here.
+    const imuAgeMs = performance.now() - lastMotionT;
+    const attitudeAgeMs = lastOrientation ? performance.now() - lastOrientation.t : Infinity;
+    if (imuAgeMs > IMU_STALE_MS) predictTo(performance.now(), 0);
     let kf = null;
     if (lane.confidence > 0 && lane.status !== LaneStatus.LOST && lane.status !== LaneStatus.UNLOCKED) {
-      kf = estimator.update(lane.eY, lane.ePsi, lane.confidence);
+      const staleAttitude = lastOrientation && attitudeAgeMs > IMU_STALE_MS;
+      kf = estimator.update(lane.eY, lane.ePsi, lane.confidence * (staleAttitude ? 0.4 : 1));
     }
     const state = estimator.initialized ? estimator.state : { eY: lane.eY ?? 0, vY: 0, ePsi: lane.ePsi ?? 0 };
     const cmd = controller.step(state, lane.status);
-    belt.send(encodeCommand(cmd, { eY: state.eY, ePsi: state.ePsi, status: lane.status }));
-    showMotors(cmd);
+    // The belt only vibrates in belt runs; it still gets all-zero commands otherwise, so the board keeps a live link.
+    const condition = $('condition').value;
+    const levels = commandToLevels(cmd);
+    belt.send(condition === Condition.BELT ? levels : [0, 0, 0, 0, 0]);
+    audioCue.update(cmd, condition === Condition.AUDIO);
+    showMotors(cmd, levels);
+    logger.record({
+      status: lane.status,
+      confidence: lane.confidence ?? 0,
+      eY_raw_m: lane.eY,
+      ePsi_raw_rad: lane.ePsi,
+      eY_kf_m: state.eY,
+      vY_kf_mps: state.vY,
+      ePsi_kf_rad: state.ePsi,
+      u_m: cmd.u,
+      zone: cmd.zone,
+      motors: cmd.motors,
+      period_ms: cmd.periodMs,
+      L1: levels[0],
+      L2: levels[1],
+      L3: levels[2],
+      L4: levels[3],
+      L5: levels[4],
+      imu_age_ms: Number.isFinite(imuAgeMs) ? Math.round(imuAgeMs) : '',
+      fps,
+    }, performance.now());
     const procMs = performance.now() - t0;
 
     const now = performance.now();
@@ -270,7 +400,8 @@ function run(cv, video) {
       estimator.initialized
         ? `kalman eY ${cm(state.eY)} vY ${cm(state.vY)}/s ePsi ${((state.ePsi * 180) / Math.PI).toFixed(1)}° ±${cm(state.sigmaY)}  ${kf && !kf.accepted ? 'REJECTED outlier' : ''}`
         : 'kalman: waiting for lock',
-      `control u ${cm(cmd.u)}  zone ${cmd.zone}  period ${cmd.periodMs} ms  level ${cmd.level}  yaw rate ${((yawRate * 180) / Math.PI).toFixed(0)}°/s  belt ${belt.connected ? 'on' : 'off'}`,
+      `control u ${cm(cmd.u)}  zone ${cmd.zone}  period ${cmd.periodMs} ms  levels [${levels.join(' ')}]`,
+      `imu age ${Number.isFinite(imuAgeMs) ? imuAgeMs.toFixed(0) + ' ms' : 'none'}  yaw rate ${((yawRate * 180) / Math.PI).toFixed(0)}°/s  belt ${belt.connected ? `on, rtt ${belt.rttMs?.toFixed(0) ?? '-'} ms, skipped ${belt.stats.skipped}` : 'off'}`,
     ].join('\n');
 
     if (video.requestVideoFrameCallback) video.requestVideoFrameCallback(frame);
@@ -279,10 +410,33 @@ function run(cv, video) {
   frame();
 }
 
-// Mirrors the belt on screen, including the pulse rhythm the firmware will produce.
-function showMotors(cmd) {
-  const on = cmd.pattern !== Pattern.OFF && cmd.periodMs > 0 && performance.now() % cmd.periodMs < cmd.periodMs / 2;
-  [...$('motors').children].forEach((el, i) => el.classList.toggle('on', on && !!(cmd.motors & (1 << i))));
+// Left/right tilt of an upright phone, from gravity (gamma itself is unstable near upright).
+// + = top of the phone tilted to the right.
+const rollDeg = (up) => (Math.atan2(-up[0], up[1]) * 180) / Math.PI;
+
+// Simulation for testing the belt and practicing the cues without a lane: phone roll of
+// +-30 degrees maps to +-0.6 m of drift (+ = tilted right = runner right of center).
+function simulatedLane(gammaDeg) {
+  const eY = Math.max(-1.2, Math.min(1.2, (gammaDeg / 30) * 0.6));
+  const half = LANE_WIDTH_M / 2;
+  const center = -eY;
+  let status = LaneStatus.INSIDE;
+  if (center - half > 0) status = LaneStatus.OUTSIDE_LEFT;
+  else if (center + half < 0) status = LaneStatus.OUTSIDE_RIGHT;
+  return {
+    status, eY, ePsi: 0, center, leftY: center - half, rightY: center + half, width: LANE_WIDTH_M,
+    heading: 0, matched: { left: true, right: true }, confidence: 1,
+  };
+}
+
+// Mirrors the belt on screen: each box shows its motor's level and blinks with the 60 ms pulses
+// the firmware produces for that level.
+function showMotors(cmd, levels) {
+  const on = cmd.pattern !== Pattern.OFF && cmd.periodMs > 0 && performance.now() % cmd.periodMs < 60;
+  [...$('motors').children].forEach((el, i) => {
+    el.textContent = levels[i] ? `M${i + 1} · ${levels[i]}` : `M${i + 1}`;
+    el.classList.toggle('on', on && levels[i] > 0);
+  });
 }
 
 // Point on the line at perpendicular offset y, distance t along the lane heading.

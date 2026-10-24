@@ -1,99 +1,205 @@
-// BLE link to the UNO R4 WiFi belt (firmware/belt_r4). Must match the UUIDs and packet layout there.
+// BLE link to the belt running firmware/lane_actuator_ble (the team's measured Plan A protocol,
+// see docs/phone-pipeline.md). UUIDs, packet and level mapping must match that sketch.
 //
-// Packet, 8 bytes, written without response at ~20Hz:
-//   [0] version (1)
-//   [1] pattern: 0 off, 1 steer, 2 heartbeat, 3 stop
-//   [2] motor mask: bit0 = motor 1 ... bit4 = motor 5
-//   [3] level 0..255 (PWM)
-//   [4] pulse period / 10 ms (0..255 -> 0..2550 ms)
-//   [5] eY in cm, int8 (telemetry for the Serial Plotter)
-//   [6] ePsi in degrees, int8 (telemetry)
-//   [7] status code (telemetry): 0 unlocked, 1 inside, 2 outside-left, 3 outside-right, 4 lost
-// The firmware generates the pulse rhythm itself, so BLE jitter never changes the rhythm, and it
-// switches to the stop pattern if no packet arrives for 300 ms.
+// Command (write without response, ~20Hz), 7 bytes: [seq lo, seq hi, L1, L2, L3, L4, L5]
+//   M1 big left, M2 small left, M3 straight heartbeat, M4 small right, M5 big right.
+//   Level per motor: 0 = off, 255 = continuously on, 1..254 = 60 ms pulses whose period goes from
+//   1000 ms (level 1) to 120 ms (level 254). The board generates the pulses.
+// ACK (notify), 2 bytes: the seq echoed back, used for round-trip time and stall detection.
+// Board watchdog: no command for 300 ms, or a disconnect -> all motors off.
 
-import { LaneStatus } from '../lane/tracker.js';
+import { Pattern } from './controller.js';
 
-export const BELT_SERVICE_UUID = '6e1f0001-5a5d-4c3a-9b1e-7c2f8a0d4b10';
-export const BELT_COMMAND_UUID = '6e1f0002-5a5d-4c3a-9b1e-7c2f8a0d4b10';
-export const PROTOCOL_VERSION = 1;
+export const BELT_NAME = 'LaneActuator';
+export const BELT_SERVICE_UUID = '06096ed2-b23b-4ba5-9737-27dba2053749';
+export const BELT_COMMAND_UUID = '14dd8746-dd9e-4308-8f98-08701035fc46';
+export const BELT_ACK_UUID = '535f34b1-32f0-4532-97d1-18f2fff4bfbe';
 
-const STATUS_CODES = {
-  [LaneStatus.UNLOCKED]: 0,
-  [LaneStatus.INSIDE]: 1,
-  [LaneStatus.OUTSIDE_LEFT]: 2,
-  [LaneStatus.OUTSIDE_RIGHT]: 3,
-  [LaneStatus.LOST]: 4,
-};
+export const PULSE_PERIOD_MAX_MS = 1000; // level 1
+export const PULSE_PERIOD_MIN_MS = 120; // level 254
 
-const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
-const int8 = (v) => clamp(Math.round(v), -128, 127) & 0xff;
-
-export function encodeCommand(cmd, { eY = 0, ePsi = 0, status = LaneStatus.UNLOCKED } = {}) {
-  return Uint8Array.from([
-    PROTOCOL_VERSION,
-    cmd.pattern,
-    cmd.motors & 0x1f,
-    clamp(Math.round(cmd.level), 0, 255),
-    clamp(Math.round(cmd.periodMs / 10), 0, 255),
-    int8(eY * 100),
-    int8((ePsi * 180) / Math.PI),
-    STATUS_CODES[status] ?? 0,
-  ]);
+// Inverse of periodFor() in the firmware.
+export function levelForPeriod(periodMs) {
+  const t = (PULSE_PERIOD_MAX_MS - periodMs) / (PULSE_PERIOD_MAX_MS - PULSE_PERIOD_MIN_MS);
+  return Math.min(254, Math.max(1, 1 + Math.round(t * 253)));
 }
 
-// Web Bluetooth connection (Bluefy on iPhone, Chrome on Ubuntu). send() is rate-limited; the
-// latest packet wins, so a slow link drops stale commands instead of queueing them.
+// HapticController command -> 5 motor levels. The firmware pulses at full duty, so the controller's
+// level (PWM strength) is not transmitted; direction is the motor, magnitude is the pulse rate.
+export function commandToLevels(cmd) {
+  const levels = [0, 0, 0, 0, 0];
+  if (cmd.pattern === Pattern.OFF || !cmd.periodMs) return levels;
+  const level = levelForPeriod(cmd.periodMs);
+  for (let i = 0; i < 5; i++) if (cmd.motors & (1 << i)) levels[i] = level;
+  return levels;
+}
+
+export function encodeLevels(seq, levels) {
+  return Uint8Array.from([seq & 0xff, (seq >> 8) & 0xff, ...levels.map((l) => Math.min(255, Math.max(0, Math.round(l))))]);
+}
+
+// Web Bluetooth link with the behavior proven in web/runner-test.html: one tap to choose the
+// device, then automatic reconnects with backoff, a stall watchdog (writing but no ACK for 1 s ->
+// reconnect), and reconnect-after-reload through getDevices() where the browser supports it.
+// send() drops a command while the previous write is still in flight (latest-wins, never queues).
 export class BeltLink {
-  constructor({ minIntervalMs = 50, onLog = () => {} } = {}) {
-    this.minIntervalMs = minIntervalMs;
+  constructor({ onLog = () => {}, onStatus = () => {} } = {}) {
     this.onLog = onLog;
-    this.characteristic = null;
-    this.pending = null;
-    this.busy = false;
-    this.lastSent = 0;
+    this.onStatus = onStatus;
+    this.device = null;
+    this.cmdChar = null;
+    this.noResponse = false;
+    this.connecting = false;
+    this.writing = false;
+    this.attempts = 0;
+    this.retryTimer = null;
+    this.restored = false;
+    this.seq = 0;
+    this.pending = new Map();
+    this.lastAckT = 0;
+    this.lastWriteT = 0;
+    this.rttMs = null;
+    this.stats = { writes: 0, acks: 0, skipped: 0, lost: 0, reconnects: 0 };
+    this.onDisconnected = this.onDisconnected.bind(this);
+    this.onAck = this.onAck.bind(this);
+    this.stallTimer = setInterval(() => this.checkStall(), 250);
   }
 
   get connected() {
-    return !!this.characteristic;
+    return !!this.cmdChar;
   }
 
-  async connect() {
-    const device = await navigator.bluetooth.requestDevice({ filters: [{ services: [BELT_SERVICE_UUID] }] });
-    device.addEventListener('gattserverdisconnected', () => {
-      this.characteristic = null;
-      this.onLog('belt disconnected');
-    });
-    const server = await device.gatt.connect();
-    const service = await server.getPrimaryService(BELT_SERVICE_UUID);
-    this.characteristic = await service.getCharacteristic(BELT_COMMAND_UUID);
-    this.onLog(`belt connected: ${device.name || device.id}`);
+  // Must run inside a tap: opens the device chooser.
+  async choose() {
+    if (this.cmdChar) return;
+    this.use(await navigator.bluetooth.requestDevice({ filters: [{ services: [BELT_SERVICE_UUID] }] }), false);
   }
 
-  send(packet) {
-    this.pending = packet;
-    this.flush();
+  // After a reload: reuse a previously permitted board without a tap, if supported.
+  async restore() {
+    if (!navigator.bluetooth?.getDevices) return false;
+    const devices = await navigator.bluetooth.getDevices();
+    const dev = devices.find((d) => d.name === BELT_NAME);
+    if (dev && !this.device) this.use(dev, true);
+    return !!dev;
   }
 
-  async flush() {
-    if (this.busy || !this.pending || !this.characteristic) return;
-    const wait = this.lastSent + this.minIntervalMs - performance.now();
-    if (wait > 0) {
-      setTimeout(() => this.flush(), wait);
+  use(device, restored) {
+    this.drop();
+    this.device = device;
+    this.restored = restored;
+    this.attempts = 0;
+    device.addEventListener('gattserverdisconnected', this.onDisconnected);
+    this.connectGatt();
+  }
+
+  drop() {
+    if (!this.device) return;
+    this.device.removeEventListener('gattserverdisconnected', this.onDisconnected);
+    try {
+      this.device.gatt.disconnect();
+    } catch {}
+    clearTimeout(this.retryTimer);
+    this.retryTimer = null;
+    this.device = null;
+    this.cmdChar = null;
+  }
+
+  async connectGatt() {
+    if (this.connecting || !this.device) return;
+    this.connecting = true;
+    this.attempts++;
+    this.onStatus(`belt connecting (attempt ${this.attempts})`, false);
+    try {
+      const server = await withTimeout(this.device.gatt.connect(), 5000);
+      const service = await server.getPrimaryService(BELT_SERVICE_UUID);
+      const cmd = await service.getCharacteristic(BELT_COMMAND_UUID);
+      const ack = await service.getCharacteristic(BELT_ACK_UUID);
+      ack.addEventListener('characteristicvaluechanged', this.onAck);
+      await ack.startNotifications();
+      this.noResponse = typeof cmd.writeValueWithoutResponse === 'function';
+      this.cmdChar = cmd;
+      this.lastAckT = performance.now();
+      this.attempts = 0;
+      this.restored = false;
+      this.onStatus('belt connected', true);
+      this.onLog('belt connected');
+    } catch (err) {
+      this.onLog(`belt connect failed: ${err.name || ''} ${err.message || err}`);
+      try {
+        this.device.gatt.disconnect();
+      } catch {}
+      if (this.restored && this.attempts >= 3) {
+        this.drop();
+        this.onStatus('tap Connect belt', false);
+      } else {
+        this.scheduleRetry([500, 1000, 2000][Math.min(this.attempts - 1, 2)]);
+      }
+    } finally {
+      this.connecting = false;
+    }
+  }
+
+  scheduleRetry(ms) {
+    if (this.retryTimer) return;
+    this.retryTimer = setTimeout(() => {
+      this.retryTimer = null;
+      this.connectGatt();
+    }, ms);
+  }
+
+  onDisconnected() {
+    this.cmdChar = null;
+    this.stats.lost += this.pending.size;
+    this.pending.clear();
+    this.stats.reconnects++;
+    this.onStatus('belt disconnected, reconnecting', false);
+    if (!this.connecting) this.scheduleRetry(500);
+  }
+
+  checkStall() {
+    const t = performance.now();
+    if (this.cmdChar && t - this.lastWriteT < 200 && t - this.lastAckT > 1000) {
+      this.onLog(`belt stalled (no ACK for ${Math.round(t - this.lastAckT)} ms), reconnecting`);
+      try {
+        this.device.gatt.disconnect(); // fires gattserverdisconnected -> reconnect
+      } catch {}
+    }
+  }
+
+  onAck(e) {
+    const seq = e.target.value.getUint16(0, true);
+    const sentT = this.pending.get(seq);
+    if (sentT === undefined) return;
+    this.pending.delete(seq);
+    this.lastAckT = performance.now();
+    this.rttMs = this.lastAckT - sentT;
+    this.stats.acks++;
+  }
+
+  async send(levels) {
+    if (!this.cmdChar) return;
+    if (this.writing) {
+      this.stats.skipped++;
       return;
     }
-    const packet = this.pending;
-    this.pending = null;
-    this.busy = true;
+    this.writing = true;
+    this.seq = (this.seq + 1) & 0xffff;
+    const packet = encodeLevels(this.seq, levels);
     try {
-      const ch = this.characteristic;
-      await (ch.writeValueWithoutResponse ? ch.writeValueWithoutResponse(packet) : ch.writeValue(packet));
-      this.lastSent = performance.now();
+      this.lastWriteT = performance.now();
+      this.pending.set(this.seq, this.lastWriteT);
+      if (this.pending.size > 64) this.pending.delete(this.pending.keys().next().value);
+      if (this.noResponse) await this.cmdChar.writeValueWithoutResponse(packet);
+      else await this.cmdChar.writeValue(packet);
+      this.stats.writes++;
     } catch (err) {
       this.onLog(`belt write failed: ${err.message || err}`);
     } finally {
-      this.busy = false;
+      this.writing = false;
     }
-    if (this.pending) this.flush();
   }
 }
+
+const withTimeout = (p, ms) =>
+  Promise.race([p, new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), ms))]);

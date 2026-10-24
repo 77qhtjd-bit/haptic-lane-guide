@@ -1,7 +1,7 @@
 // Offline cache for the demo: network first (so a fresh push always wins while developing),
 // cached copy when the network is gone (venue Wi-Fi down, airplane mode).
 
-const CACHE = 'lane-guide-v1';
+const CACHE = 'lane-guide-v2';
 const SHELL = [
   './spike-ground.html',
   './vendor/opencv.js',
@@ -11,6 +11,8 @@ const SHELL = [
   './control/estimator.js',
   './control/controller.js',
   './control/protocol.js',
+  './control/logger.js',
+  './control/audio.js',
 ];
 
 self.addEventListener('install', (event) => {

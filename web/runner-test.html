@@ -1,0 +1,338 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Runner Test</title>
+<style>
+  body { margin: 0; padding: 16px; background: #000; color: #fff; font: 22px/1.45 -apple-system, system-ui, sans-serif; }
+  button { font-size: 28px; padding: 20px; margin: 6px 0; width: 100%; border: 0; border-radius: 10px; background: #0a84ff; color: #fff; }
+  button:disabled { opacity: .5; }
+  label { display: block; margin: 8px 0; font-size: 24px; }
+  input[type=checkbox] { width: 26px; height: 26px; vertical-align: middle; }
+  .v { font-weight: 700; font-variant-numeric: tabular-nums; }
+  video { width: 120px; float: right; }
+  #errors { color: #ff453a; font-size: 16px; white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<!-- Final-architecture test without any WebSocket: IMU [+ camera] [+ decide() + BLE to the 5-motor belt].
+     Results are POSTed to the laptop every 10 s (small JSON) for analysis. -->
+<label><input type="checkbox" id="usecam"> Camera on</label>
+<label><input type="checkbox" id="usedecide"> Decide + BLE (needs camera)</label>
+<button id="ble">Connect Arduino (BLE)</button>
+<button id="start">Start IMU test</button>
+<video id="video" playsinline muted autoplay></video>
+<p>IMU rate: <span class="v" id="hz">-</span></p>
+<p>IMU gaps &gt;200 ms: <span class="v" id="gaps">-</span></p>
+<p>Max gap: <span class="v" id="max">-</span></p>
+<p>Recent gaps (s:ms): <span class="v" id="recent" style="font-size:18px">-</span></p>
+<p>Decide / BLE writes: <span class="v" id="rate">-</span></p>
+<p>Frame → board med/p95: <span class="v" id="e2e">-</span></p>
+<p>BLE RTT med/p95: <span class="v" id="rtt">-</span></p>
+<p>IMU age at decide med/p95: <span class="v" id="age">-</span></p>
+<p>BLE acks / lost / skipped: <span class="v" id="acks">-</span></p>
+<p>BLE reconnects: <span class="v" id="reconn">-</span></p>
+<p>getDevices (no-tap reconnect after reload): <span class="v" id="getdev" style="font-size:18px">-</span></p>
+<p>Sent to laptop: <span class="v" id="sent" style="font-size:18px">-</span></p>
+<button id="saveres">Save results to phone</button>
+<p style="font-size:16px;color:#888">Page version: <span id="ver"></span></p>
+<div id="errors"></div>
+<script>
+"use strict";
+const PAGE_VERSION = "runner-5motor-1";
+const $ = (id) => document.getElementById(id);
+$("ver").textContent = PAGE_VERSION;
+const now = () => performance.timeOrigin + performance.now();
+function err(msg) { $("errors").textContent = new Date().toLocaleTimeString() + " " + msg + "\n" + $("errors").textContent.slice(0, 500); }
+window.addEventListener("error", (e) => err("JS error: " + e.message));
+window.addEventListener("unhandledrejection", (e) => err("Promise: " + (e.reason && e.reason.message || e.reason)));
+
+// ---------- IMU gap statistics ----------
+let first = 0, last = 0, count = 0, max = 0, n = 0, latestMotion = null;
+const recent = [], allGaps = [], hzSeries = [];
+const run = new Date().toISOString().replace(/[-:T]/g, "").slice(0, 14);   // run id (UTC)
+function onMotion(e) {
+  const t = now();
+  if (last) {
+    const dt = t - last;
+    if (dt > 200) {
+      count++;
+      allGaps.push([+((t - first) / 1000).toFixed(1), Math.round(dt)]);
+      recent.push(`${((t - first) / 1000).toFixed(0)}:${dt.toFixed(0)}`);
+      if (recent.length > 8) recent.shift();
+    }
+    max = Math.max(max, dt);
+  } else first = t;
+  last = t;
+  n++;
+  const g = e.accelerationIncludingGravity || {};
+  latestMotion = { t, gx: g.x, gy: g.y, gz: g.z };
+}
+
+// ---------- BLE (same protocol as lane_actuator_ble) ----------
+const BLE_SERVICE = "06096ed2-b23b-4ba5-9737-27dba2053749";
+const BLE_CMD = "14dd8746-dd9e-4308-8f98-08701035fc46";
+const BLE_ACK = "535f34b1-32f0-4532-97d1-18f2fff4bfbe";
+let bleCmd = null, bleWriting = false, bleNoResp = false, seq = 0;
+const pending = new Map(), rtts = [], e2es = [], ages = [], procs = [];
+const cnt = { decide: 0, writes: 0, acks: 0, lost: 0, skipped: 0 };
+if (!navigator.bluetooth) { $("ble").disabled = true; $("ble").textContent = "No Web Bluetooth (use Bluefy)"; }
+
+// ---------- Auto-reconnect ----------
+// The device chooser needs a tap only once per page load. After that, any disconnect (or a stall:
+// connected but no ACK for STALL_MS while writing) triggers reconnect attempts with backoff,
+// without user interaction. Events are logged and uploaded (ble_events).
+const RETRY_MS = [500, 1000, 2000];   // then every 2 s
+const CONNECT_TIMEOUT_MS = 5000, STALL_MS = 1000;
+let bleDevice = null, connecting = false, attempts = 0, downSince = 0, lastAckT = 0, lastWriteT = 0;
+let fromGetDevices = false;            // device restored after reload (may be stale)
+const GETDEVICES_MAX_ATTEMPTS = 3;
+const bleEvents = [];   // [t_since_start_s, event, detail]
+function bleEvent(ev, detail) {
+  bleEvents.push([first ? +((now() - first) / 1000).toFixed(1) : 0, ev, detail ?? ""]);
+}
+function bleStatus(text, ok) {
+  $("ble").textContent = text;
+  $("ble").style.background = ok ? "#30d158" : (bleDevice ? "#ff9f0a" : "#0a84ff");
+}
+let retryTimer = null;
+function scheduleRetry(ms) {   // at most one pending retry
+  if (retryTimer) return;
+  retryTimer = setTimeout(() => { retryTimer = null; connectGatt(); }, ms);
+}
+const withTimeout = (p, ms) => Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error("timeout")), ms))]);
+
+async function connectGatt() {
+  if (connecting || !bleDevice) return;
+  connecting = true;
+  attempts++;
+  bleStatus(`BLE reconnecting... (attempt ${attempts})`, false);
+  try {
+    const server = await withTimeout(bleDevice.gatt.connect(), CONNECT_TIMEOUT_MS);
+    const svc = await server.getPrimaryService(BLE_SERVICE);
+    const cmd = await svc.getCharacteristic(BLE_CMD);
+    const ack = await svc.getCharacteristic(BLE_ACK);
+    ack.addEventListener("characteristicvaluechanged", onAck);
+    await ack.startNotifications();
+    bleNoResp = typeof cmd.writeValueWithoutResponse === "function";
+    bleCmd = cmd;
+    lastAckT = now();
+    if (downSince) bleEvent("reconnected", `down ${Math.round(now() - downSince)} ms, ${attempts} attempt(s)`);
+    else bleEvent("connected", "");
+    downSince = 0;
+    attempts = 0;
+    fromGetDevices = false;            // proven to work: keep auto-reconnecting to it
+    bleStatus("BLE connected" + (bleNoResp ? "" : " (with response)"), true);
+  } catch (e) {
+    bleEvent("attempt_failed", `${e.name}: ${e.message}`);
+    try { bleDevice.gatt.disconnect(); } catch (_) {}
+    if (fromGetDevices && attempts >= GETDEVICES_MAX_ATTEMPTS) {
+      // A restored device that never connected: drop it and wait for a tap (opens the chooser).
+      bleEvent("getDevices_gave_up", "");
+      dropDevice();
+      bleStatus("Tap to connect Arduino (BLE)", false);
+    } else scheduleRetry(RETRY_MS[Math.min(attempts - 1, RETRY_MS.length - 1)]);
+  } finally { connecting = false; }
+}
+
+function onDisconnected() {
+  bleCmd = null;
+  for (const [s] of pending) { pending.delete(s); cnt.lost++; }   // in-flight writes are lost
+  if (!downSince) { downSince = now(); bleEvent("disconnected", ""); }
+  if (!connecting) scheduleRetry(RETRY_MS[0]);
+}
+
+// Stall watchdog: connected and writing, but no ACK for STALL_MS -> force a reconnect.
+setInterval(() => {
+  if (bleCmd && now() - lastWriteT < 200 && now() - lastAckT > STALL_MS) {
+    bleEvent("stall", `no ACK for ${Math.round(now() - lastAckT)} ms`);
+    try { bleDevice.gatt.disconnect(); } catch (_) {}   // fires gattserverdisconnected -> reconnect
+  }
+}, 250);
+
+function useDevice(dev, restored) {
+  dropDevice();
+  bleDevice = dev;
+  fromGetDevices = restored;
+  attempts = 0;
+  dev.addEventListener("gattserverdisconnected", onDisconnected);
+  connectGatt();
+}
+function dropDevice() {
+  if (!bleDevice) return;
+  bleDevice.removeEventListener("gattserverdisconnected", onDisconnected);
+  try { bleDevice.gatt.disconnect(); } catch (_) {}
+  if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; }
+  bleDevice = null;
+  bleCmd = null;
+}
+
+// A tap always opens the device chooser unless we are connected right now.
+$("ble").onclick = async () => {
+  if (bleCmd) return;
+  try { useDevice(await navigator.bluetooth.requestDevice({ filters: [{ services: [BLE_SERVICE] }] }), false); }
+  catch (e) { err("BLE: " + e.name + " " + e.message); }
+};
+
+// After a page reload: reuse a previously permitted device without a tap, if the browser supports it.
+const hasGetDevices = !!(navigator.bluetooth && navigator.bluetooth.getDevices);
+$("getdev").textContent = hasGetDevices ? "supported" : "not supported (tap Connect after reload)";
+if (hasGetDevices) navigator.bluetooth.getDevices().then((devs) => {
+  bleEvent("getDevices", devs.map((d) => d.name || "?").join(",") || "none");
+  const dev = devs.find((d) => d.name === "LaneActuator");   // only the known board, never a nameless entry
+  if (dev && !bleDevice) useDevice(dev, true);
+}).catch((e) => err("getDevices: " + e.message));
+
+function onAck(e) {
+  const t = now();
+  const row = pending.get(e.target.value.getUint16(0, true));
+  if (!row) return;
+  pending.delete(row.seq);
+  lastAckT = t;
+  const rtt = t - row.write_t;
+  rtts.push(Math.round(rtt));
+  e2es.push(Math.round(row.write_t + rtt / 2 - row.frame_t));
+  cnt.acks++;
+}
+
+// levels: 5 pulse levels 0..255 for M1..M5 (left to right). Packet: [seq lo, seq hi, L1..L5].
+async function bleSend(seqNo, levels, frameT) {
+  if (!bleCmd) return;
+  if (bleWriting) { cnt.skipped++; return; }
+  bleWriting = true;
+  try {
+    const row = { seq: seqNo, frame_t: frameT, write_t: now() };
+    lastWriteT = row.write_t;
+    pending.set(seqNo, row);
+    const buf = new Uint8Array([seqNo & 0xff, seqNo >> 8, ...levels]);
+    if (bleNoResp) await bleCmd.writeValueWithoutResponse(buf); else await bleCmd.writeValue(buf);
+    cnt.writes++;
+  } catch (e) { err("BLE write: " + e.message); }
+  finally { bleWriting = false; }
+}
+
+// ---------- Camera + decide (same as the main page, no WebSocket) ----------
+const video = $("video");
+const grab = document.createElement("canvas");
+const grabCtx = grab.getContext("2d", { willReadFrequently: true });
+const DECIDE_HZ = 20;
+let lastDecideT = 0, lastRvfc = 0, decidePending = false;
+
+// PLACEHOLDER (same as decide() in static/index.html): 1 s left / 1 s right.
+// Returns 5 pulse levels for M1 big left, M2 small left, M3 straight heartbeat, M4 small right, M5 big right.
+// For now: steps through the motors once per second so every motor can be checked.
+const PLACEHOLDER_STEPS = [[255, 0, 0, 0, 0], [0, 128, 0, 0, 0], [0, 0, 40, 0, 0], [0, 0, 0, 128, 0], [0, 0, 0, 0, 255]];
+function decide(pixels, w, h, imu) {
+  return PLACEHOLDER_STEPS[Math.floor(Date.now() / 1000) % PLACEHOLDER_STEPS.length];
+}
+
+function decideFrame(t) {
+  if (!$("usedecide").checked || !video.videoWidth) return;
+  if (t - lastDecideT < 1000 / DECIDE_HZ - 5) return;
+  lastDecideT = t;
+  const w = video.videoWidth, h = video.videoHeight;
+  grab.width = w; grab.height = h;
+  grabCtx.drawImage(video, 0, 0, w, h);
+  const imu = latestMotion;
+  const levels = decide(grabCtx.getImageData(0, 0, w, h).data, w, h, imu);
+  if (imu) ages.push(Math.round(t - imu.t));
+  procs.push(Math.round(now() - t));
+  cnt.decide++;
+  seq = (seq + 1) & 0xffff;
+  bleSend(seq, levels, t);
+}
+function scheduleDecide() {
+  if (decidePending || !("requestVideoFrameCallback" in HTMLVideoElement.prototype)) return;
+  decidePending = true;
+  video.requestVideoFrameCallback((ts, md) => {
+    decidePending = false;
+    lastRvfc = now();
+    try { decideFrame(performance.timeOrigin + (md && md.captureTime ? md.captureTime : ts)); }
+    catch (e) { err("decide: " + e.message); }
+    scheduleDecide();
+  });
+}
+setInterval(() => {   // watchdog: re-arm the frame callback chain; timer fallback meanwhile
+  if (!video.videoWidth || now() - lastRvfc < 300) return;
+  decidePending = false;
+  scheduleDecide();
+  try { decideFrame(now()); } catch (e) { err("decide: " + e.message); }
+}, 1000 / DECIDE_HZ);
+video.addEventListener("playing", scheduleDecide);
+
+// ---------- Start ----------
+$("start").onclick = async () => {
+  $("start").disabled = true;
+  const motionP = (typeof DeviceMotionEvent !== "undefined" && typeof DeviceMotionEvent.requestPermission === "function")
+    ? DeviceMotionEvent.requestPermission().catch((e) => e.message) : Promise.resolve("granted");
+  const camP = $("usecam").checked || $("usedecide").checked
+    ? navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment", width: 640, height: 480, frameRate: 30 }, audio: false })
+        .then((s) => { video.srcObject = s; return video.play(); }).then(() => "ok", (e) => { err("camera: " + e.message); return "fail"; })
+    : Promise.resolve("off");
+  const [p, cam] = await Promise.all([motionP, camP]);
+  if (p !== "granted") { $("start").textContent = "motion permission: " + p; return; }
+  window.addEventListener("devicemotion", onMotion);
+  if ("wakeLock" in navigator) navigator.wakeLock.request("screen").catch(() => {});
+  $("start").textContent = `Running (camera ${cam}) - don't touch`;
+};
+
+// ---------- Display + upload ----------
+const medP95 = (a) => {
+  if (!a.length) return "-";
+  const r = [...a].sort((x, y) => x - y);
+  return `${r[r.length >> 1]} / ${r[Math.min(r.length - 1, Math.floor(r.length * 0.95))]} ms`;
+};
+setInterval(() => {
+  const cutoff = now() - 1000;
+  for (const [s, row] of pending) if (row.write_t < cutoff) { pending.delete(s); cnt.lost++; }
+  $("rate").textContent = `${cnt.decide} / ${cnt.writes} per s`;
+  cnt.decide = cnt.writes = 0;
+  $("e2e").textContent = medP95(e2es.slice(-300));
+  $("rtt").textContent = medP95(rtts.slice(-300));
+  $("age").textContent = medP95(ages.slice(-300));
+  $("acks").textContent = `${cnt.acks} / ${cnt.lost} / ${cnt.skipped}`;
+  const rc = bleEvents.filter((e) => e[1] === "reconnected");
+  $("reconn").textContent = rc.length ? `${rc.length}, last: ${rc[rc.length - 1][2]}` : "0";
+  if (!first) return;
+  const min = (performance.now() - (first - performance.timeOrigin)) / 60000;
+  $("hz").textContent = n + " Hz";
+  hzSeries.push(n);
+  n = 0;
+  $("gaps").textContent = `${count} in ${min.toFixed(1)} min`;
+  $("max").textContent = max.toFixed(0) + " ms";
+  $("recent").textContent = recent.join("  ") || "none";
+}, 1000);
+
+// Results: auto-sent to the laptop every 10 s when served by the laptop (data/imutest/<run>.json);
+// on GitHub Pages there is no server, so use "Save results to phone" (then /import is not needed:
+// the JSON can be copied into data/imutest/ by hand).
+const HAS_SERVER = !location.hostname.endsWith("github.io");
+if (!HAS_SERVER) $("sent").textContent = "no server (GitHub Pages) - use Save results to phone";
+function results() {
+  return { userAgent: navigator.userAgent, camera: $("usecam").checked || $("usedecide").checked,
+                             decide_ble: $("usedecide").checked, ble_connected: !!bleCmd,
+                             elapsed_s: (now() - first) / 1000, gaps_over_200ms: count, max_gap_ms: Math.round(max),
+                             gaps: allGaps, hz_per_second: hzSeries, ble_rtt_ms: rtts, frame_to_board_ms: e2es,
+                             imu_age_ms: ages, frame_to_decided_ms: procs, ble_acks: cnt.acks, ble_lost: cnt.lost,
+                             ble_skipped: cnt.skipped, ble_events: bleEvents, get_devices: hasGetDevices,
+                             page_version: PAGE_VERSION };
+}
+setInterval(async () => {
+  if (!first || !HAS_SERVER) return;
+  try {
+    const r = await fetch("/api/imutest?run=" + run, { method: "POST", headers: { "Content-Type": "application/json" },
+                                                       body: JSON.stringify(results()) });
+    $("sent").textContent = r.ok ? new Date().toLocaleTimeString() : "HTTP " + r.status;
+  } catch (e) { $("sent").textContent = "failed: " + e.message; }
+}, 10000);
+$("saveres").onclick = async () => {
+  const file = new File([JSON.stringify(results())], `runner_${run}.json`, { type: "application/json" });
+  try {
+    if (navigator.canShare && navigator.canShare({ files: [file] })) await navigator.share({ files: [file] });
+    else { const a = document.createElement("a"); a.href = URL.createObjectURL(file); a.download = file.name; a.click(); }
+  } catch (e) { if (e.name !== "AbortError") err("save: " + e.message); }
+};
+</script>
+</body>
+</html>
