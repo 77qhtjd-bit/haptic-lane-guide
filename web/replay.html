@@ -387,6 +387,9 @@ log(`${PAGE_VERSION}: loading OpenCV...`);
 loadCv().then(async ({ cv: m }) => {
   cv = m;
   log('OpenCV ready');
+  // Settings can also come from the URL (?h=1.5&hfov=60&laneMin=1&laneMax=1.3&vmin=&smax=&lag=).
+  for (const id of ['h', 'hfov', 'vmin', 'smax', 'lag', 'laneMin', 'laneMax']) if (params.get(id)) $(id).value = params.get(id);
+  if (params.get('autolock') === '0') $('autolock').checked = false;
   const base = params.get('clip');
   if (base) {
     await loadFromUrl(base);
