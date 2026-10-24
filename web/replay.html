@@ -263,7 +263,7 @@ function processFrame(mediaTime) {
     estimator.update(lane.eY, lane.ePsi, lane.confidence * (attitudeAgeMs > IMU_STALE_MS ? 0.4 : 1));
   }
   const state = estimator.initialized ? estimator.state : { eY: lane.eY ?? 0, vY: 0, ePsi: lane.ePsi ?? 0 };
-  const cmd = controller.step(state, lane.status, lane.curvature ?? 0);
+  const cmd = controller.step(state, lane.status, lane.curvature ?? 0, T);
   const levels = commandToLevels(cmd);
   const procMs = performance.now() - t0;
   const cue = cueText(cmd, tracker.locked, !!candidate);
@@ -292,7 +292,7 @@ function processFrame(mediaTime) {
 
   const shown = tracker.locked ? lane : candidate && candidateLane(candidate, res.heading);
   drawView(vctx, img, detector, res, shown, cue,
-    tracker.locked && lane.status !== LaneStatus.LOST ? controller.aimPoint(state, lane.curvature ?? 0) : null);
+    tracker.locked && lane.status !== LaneStatus.LOST ? controller.lastAim : null);
   drawBev($('bev'), res, shown);
   const cm = (v) => (v == null || v === '' || Number.isNaN(v) ? '-' : (v * 100).toFixed(1));
   $('stats').textContent = [
