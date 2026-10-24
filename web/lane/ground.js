@@ -149,8 +149,8 @@ export function findHeading(points, count, band, { center = 0, rangeDeg = 25, st
     const theta = center + k * step;
     scores.push(sharpness(lateralHistogram(rotatePoints(points, count, theta), count, band)));
   }
-  let best = 0;
-  for (let i = 1; i < scores.length; i++) if (scores[i] > scores[best]) best = i;
+  let best = n; // ties (e.g. no points at all) keep the prior
+  for (let i = 0; i < scores.length; i++) if (scores[i] > scores[best]) best = i;
   let offset = 0;
   if (best > 0 && best < scores.length - 1) {
     const denom = scores[best - 1] - 2 * scores[best] + scores[best + 1];

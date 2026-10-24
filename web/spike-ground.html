@@ -14,10 +14,47 @@
   #stats { white-space: pre; font-family: ui-monospace, monospace; }
   #log { white-space: pre-wrap; font-family: ui-monospace, monospace; color: #f88; max-height: 140px; overflow: auto; }
   video { display: none; }
+  #lock { margin-top: 8px; background: #fc3; }
+  #status { font-size: 22px; font-weight: 700; margin: 8px 0; }
+  #status.inside { color: #3f6; }
+  #status.outside-left, #status.outside-right, #status.lost { color: #f55; }
+  #connect { margin-top: 8px; background: #39f; }
+  #motors { display: flex; gap: 6px; margin: 8px 0; }
+  #motors div { flex: 1; text-align: center; padding: 10px 0; border-radius: 8px; background: #333; font-weight: 700; }
+  #motors div.on { background: #fc3; color: #000; }
+  #runs { border: 1px solid #444; border-radius: 10px; padding: 8px; margin: 8px 0; }
+  #runs select, #runs button { font-size: 16px; padding: 10px; }
+  #runs button { width: auto; flex: 1; }
+  #runTable { width: 100%; border-collapse: collapse; font-family: ui-monospace, monospace; }
+  #runTable td, #runTable th { border-bottom: 1px solid #333; padding: 2px 4px; text-align: right; }
+  #csvOut { width: 100%; height: 120px; font-family: ui-monospace, monospace; font-size: 11px; }
 </style>
 </head>
 <body>
 <button id="start">Start (camera + motion)</button>
+<button id="lock" hidden>Lock lane</button>
+<button id="connect">Connect belt (BLE: LaneActuator)</button>
+<label><input type="checkbox" id="sim"> Simulate lane: tilt the phone left/right = drift left/right (no lane needed)</label>
+<div id="status"></div>
+<div id="motors"><div>1</div><div>2</div><div>3</div><div>4</div><div>5</div></div>
+<div id="runs">
+  <div class="row">
+    <select id="condition">
+      <option value="belt">belt</option>
+      <option value="audio">audio</option>
+      <option value="none">no feedback</option>
+    </select>
+    <button id="runBtn">Start run</button>
+  </div>
+  <table id="runTable"></table>
+  <div class="row">
+    <button id="csvDownload">Download CSV</button>
+    <button id="csvCopy">Copy CSV</button>
+    <button id="csvShow">Show CSV</button>
+    <button id="runsClear">Clear runs</button>
+  </div>
+  <textarea id="csvOut" hidden readonly></textarea>
+</div>
 <div class="row">
   <canvas id="view"></canvas>
   <canvas id="bev" width="240" height="320"></canvas>
@@ -40,10 +77,16 @@
 <video id="video" playsinline muted></video>
 <canvas id="proc" hidden></canvas>
 
-<script async src="https://docs.opencv.org/4.10.0/opencv.js"></script>
+<script async src="./vendor/opencv.js"></script>
 <script type="module">
 import { GroundLineDetector, DEFAULT_CONFIG } from './lane/detector.js';
-import { AttitudeBuffer, upFromOrientation, deviceToCamera, groundToPixel } from './lane/ground.js';
+import { AttitudeBuffer, upFromOrientation, deviceToCamera, groundToPixel, LANE_WIDTH_M } from './lane/ground.js';
+import { LaneTracker, LaneStatus } from './lane/tracker.js';
+import { LaneEstimator, yawRateFromMotion } from './control/estimator.js';
+import { HapticController, Pattern } from './control/controller.js';
+import { BeltLink, commandToLevels } from './control/protocol.js';
+import { RunLogger, Condition } from './control/logger.js';
+import { AudioCue } from './control/audio.js';
 
 const $ = (id) => document.getElementById(id);
 const logEl = $('log');
@@ -51,21 +94,131 @@ const log = (msg) => { logEl.textContent = `${new Date().toLocaleTimeString()} $
 window.addEventListener('error', (e) => log(`error: ${e.message}`));
 window.addEventListener('unhandledrejection', (e) => log(`rejection: ${e.reason}`));
 
-async function loadCv() {
-  while (!window.cv) await new Promise((r) => setTimeout(r, 50));
-  let cv = window.cv;
-  if (cv instanceof Promise) cv = await cv;
-  if (!cv.Mat) await new Promise((r) => { cv.onRuntimeInitialized = r; });
-  return cv;
+// Resolves to { cv }. The OpenCV.js module is a thenable (Emscripten's Module.then), so it must never
+// be awaited or returned from an async function: promise adoption calls its then() forever and
+// freezes the page. Wrapping it in an object avoids that.
+function loadCv() {
+  return new Promise((resolve) => {
+    const poll = () => {
+      const cv = window.cv;
+      if (!cv) return void setTimeout(poll, 50);
+      if (cv.Mat) return resolve({ cv });
+      if (typeof cv.then === 'function') return void cv.then((m) => resolve({ cv: m }));
+      cv.onRuntimeInitialized = () => resolve({ cv });
+    };
+    poll();
+  });
 }
 
 const attitude = new AttitudeBuffer();
 let lastOrientation = null;
+let upDevice = null;
 window.addEventListener('deviceorientation', (e) => {
   if (e.beta == null) return;
-  lastOrientation = { beta: e.beta, gamma: e.gamma };
-  attitude.push(performance.now(), deviceToCamera(upFromOrientation(e.beta, e.gamma)));
+  lastOrientation = { beta: e.beta, gamma: e.gamma, t: performance.now() };
+  upDevice = upFromOrientation(e.beta, e.gamma);
+  attitude.push(performance.now(), deviceToCamera(upDevice));
 });
+
+// Kalman prediction runs on every IMU sample; vision updates arrive per frame.
+// iOS sometimes stops delivering motion events for up to ~2 s while the camera runs (measured in
+// docs/phone-pipeline.md). When the IMU is older than IMU_STALE_MS, the frame loop predicts instead
+// (without yaw rate), and vision measured with the stale attitude counts for less.
+const IMU_STALE_MS = 100;
+const estimator = new LaneEstimator();
+const controller = new HapticController();
+let lastMotionT = -Infinity;
+let lastPredictT = null;
+let yawRate = 0;
+function predictTo(t, rate) {
+  if (lastPredictT !== null && t > lastPredictT) estimator.predict((t - lastPredictT) / 1000, rate);
+  lastPredictT = t;
+}
+window.addEventListener('devicemotion', (e) => {
+  const t = performance.now();
+  if (!e.rotationRate || !upDevice) return;
+  yawRate = yawRateFromMotion(e.rotationRate, upDevice);
+  lastMotionT = t;
+  predictTo(t, yawRate);
+});
+
+const belt = new BeltLink({
+  onLog: (m) => log(m),
+  onStatus: (text, ok) => {
+    $('connect').textContent = text;
+    $('connect').style.background = ok ? '#2d7' : '#39f';
+  },
+});
+if (navigator.bluetooth) belt.restore().catch((err) => log(`belt restore: ${err.message || err}`));
+else $('connect').textContent = 'No Web Bluetooth (open in Bluefy)';
+const audioCue = new AudioCue();
+
+// Runs for the proof chart: same lane, walked under each condition; compare RMS of eY.
+const logger = new RunLogger();
+const cm1 = (m) => (Number.isFinite(m) ? (m * 100).toFixed(1) : '-');
+function renderRuns() {
+  const head = '<tr><th>#</th><th>cond</th><th>s</th><th>RMS cm</th><th>max cm</th><th>inside %</th><th>tracked %</th></tr>';
+  $('runTable').innerHTML = head + logger.runs.map((r, i) => {
+    const s = r.summary;
+    return `<tr><td>${i + 1}</td><td>${r.condition}</td><td>${s.durationS.toFixed(0)}</td><td>${cm1(s.rmsEyKf)}</td>` +
+      `<td>${cm1(s.maxAbsEy)}</td><td>${s.insidePct.toFixed(0)}</td><td>${s.trackedPct.toFixed(0)}</td></tr>`;
+  }).join('');
+}
+renderRuns();
+$('runBtn').onclick = () => {
+  if (logger.recording) {
+    const run = logger.stop();
+    $('runBtn').textContent = 'Start run';
+    $('condition').disabled = false;
+    log(run ? `run saved: ${run.condition}, RMS ${cm1(run.summary.rmsEyKf)} cm` : 'run had no frames');
+    renderRuns();
+  } else {
+    logger.start($('condition').value);
+    $('runBtn').textContent = 'Stop run';
+    $('condition').disabled = true;
+  }
+};
+// Downloads may be blocked inside some iOS browsers, so copy and show are there as fallbacks.
+$('csvDownload').onclick = () => {
+  const url = URL.createObjectURL(new Blob([logger.toCsv()], { type: 'text/csv' }));
+  const a = Object.assign(document.createElement('a'), { href: url, download: `lane-runs-${Date.now()}.csv` });
+  document.body.append(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+};
+$('csvCopy').onclick = async () => {
+  try {
+    await navigator.clipboard.writeText(logger.toCsv());
+    log('CSV copied');
+  } catch (err) {
+    log(`copy failed (${err.message || err}); use Show CSV`);
+  }
+};
+$('csvShow').onclick = () => {
+  $('csvOut').hidden = !$('csvOut').hidden;
+  $('csvOut').value = logger.toCsv();
+};
+let clearArmed = false;
+$('runsClear').onclick = () => {
+  if (!clearArmed) {
+    clearArmed = true;
+    $('runsClear').textContent = 'Tap again to clear';
+    setTimeout(() => { clearArmed = false; $('runsClear').textContent = 'Clear runs'; }, 3000);
+    return;
+  }
+  logger.clear();
+  renderRuns();
+  clearArmed = false;
+  $('runsClear').textContent = 'Clear runs';
+};
+$('connect').onclick = async () => {
+  try {
+    await belt.choose();
+  } catch (err) {
+    log(`belt connect failed: ${err.name || ''} ${err.message || err}`);
+  }
+};
 
 const jitter = { left: [], right: [] };
 function pushJitter(key, v) {
@@ -81,8 +234,12 @@ const std = (a) => {
 
 $('start').onclick = async () => {
   try {
+    audioCue.start(); // must happen inside the tap, before any await
     if (typeof DeviceOrientationEvent !== 'undefined' && DeviceOrientationEvent.requestPermission) {
       log(`orientation permission: ${await DeviceOrientationEvent.requestPermission()}`);
+    }
+    if (typeof DeviceMotionEvent !== 'undefined' && DeviceMotionEvent.requestPermission) {
+      log(`motion permission: ${await DeviceMotionEvent.requestPermission()}`);
     }
     const stream = await navigator.mediaDevices.getUserMedia({
       video: { facingMode: 'environment', width: { ideal: 640 }, height: { ideal: 480 } },
@@ -91,7 +248,7 @@ $('start').onclick = async () => {
     const video = $('video');
     video.srcObject = stream;
     await video.play();
-    const cv = await loadCv();
+    const { cv } = await loadCv();
     $('start').hidden = true;
     run(cv, video);
   } catch (err) {
@@ -116,6 +273,18 @@ function run(cv, video) {
   let lastT = performance.now();
   let fps = 0;
   let prevHeading = 0;
+  let latest = null;
+  const tracker = new LaneTracker();
+  $('lock').hidden = false;
+  $('lock').onclick = () => {
+    const ok = latest?.ok && tracker.lock(latest.peaks, latest.heading);
+    if (ok) {
+      controller.zone = 0;
+      estimator.reset(tracker.last.eY, tracker.last.ePsi);
+      lastPredictT = performance.now();
+    }
+    log(ok ? `locked: width ${(tracker.width * 100).toFixed(0)} cm` : 'lock failed: need one line on each side, ~122 cm apart');
+  };
 
   const frame = () => {
     const cfg = {
@@ -147,15 +316,63 @@ function run(cv, video) {
     const rgba = cv.matFromImageData(img);
     const res = detector.process(rgba, up, prevHeading);
     rgba.delete();
-    prevHeading = res.ok && res.peaks.length ? res.heading : 0;
+    latest = res;
+    const lane = $('sim').checked
+      ? simulatedLane(upDevice ? rollDeg(upDevice) : +$('mgamma').value)
+      : tracker.update(res.ok ? res.peaks : [], res.ok ? res.heading : tracker.heading);
+    // Once locked, the lane's own heading is the better prior than whatever the last frame found.
+    if (tracker.locked && lane.status !== LaneStatus.LOST) prevHeading = lane.heading;
+    else prevHeading = res.ok && res.peaks.length ? res.heading : 0;
+    $('status').textContent = lane.status === LaneStatus.UNLOCKED
+      ? 'not locked'
+      : `${lane.status}   eY ${(lane.eY * 100).toFixed(0)} cm   eψ ${((lane.ePsi * 180) / Math.PI).toFixed(1)}°`;
+    $('status').className = lane.status;
+
+    // IMU stalled (or no gyro at all, e.g. a laptop webcam): keep the filter moving from here.
+    const imuAgeMs = performance.now() - lastMotionT;
+    const attitudeAgeMs = lastOrientation ? performance.now() - lastOrientation.t : Infinity;
+    if (imuAgeMs > IMU_STALE_MS) predictTo(performance.now(), 0);
+    let kf = null;
+    if (lane.confidence > 0 && lane.status !== LaneStatus.LOST && lane.status !== LaneStatus.UNLOCKED) {
+      const staleAttitude = lastOrientation && attitudeAgeMs > IMU_STALE_MS;
+      kf = estimator.update(lane.eY, lane.ePsi, lane.confidence * (staleAttitude ? 0.4 : 1));
+    }
+    const state = estimator.initialized ? estimator.state : { eY: lane.eY ?? 0, vY: 0, ePsi: lane.ePsi ?? 0 };
+    const cmd = controller.step(state, lane.status);
+    // The belt only vibrates in belt runs; it still gets all-zero commands otherwise, so the board keeps a live link.
+    const condition = $('condition').value;
+    const levels = commandToLevels(cmd);
+    belt.send(condition === Condition.BELT ? levels : [0, 0, 0, 0, 0]);
+    audioCue.update(cmd, condition === Condition.AUDIO);
+    showMotors(cmd, levels);
+    logger.record({
+      status: lane.status,
+      confidence: lane.confidence ?? 0,
+      eY_raw_m: lane.eY,
+      ePsi_raw_rad: lane.ePsi,
+      eY_kf_m: state.eY,
+      vY_kf_mps: state.vY,
+      ePsi_kf_rad: state.ePsi,
+      u_m: cmd.u,
+      zone: cmd.zone,
+      motors: cmd.motors,
+      period_ms: cmd.periodMs,
+      L1: levels[0],
+      L2: levels[1],
+      L3: levels[2],
+      L4: levels[3],
+      L5: levels[4],
+      imu_age_ms: Number.isFinite(imuAgeMs) ? Math.round(imuAgeMs) : '',
+      fps,
+    }, performance.now());
     const procMs = performance.now() - t0;
 
     const now = performance.now();
     fps = 0.9 * fps + 0.1 * (1000 / (now - lastT));
     lastT = now;
 
-    drawView(vctx, img, detector, res);
-    drawBev($('bev'), res);
+    drawView(vctx, img, detector, res, lane);
+    drawBev($('bev'), res, lane);
     drawHist($('hist'), res);
 
     let left = null;
@@ -177,6 +394,14 @@ function run(cv, video) {
       `L ${cm(left?.y)}  R ${cm(right?.y)}  lane width ${left && right ? cm(right.y - left.y) : '  -  '}`,
       `jitter 2s (std, cm)  L ${cm(std(jitter.left))}  R ${cm(std(jitter.right))}   target < 10`,
       `h estimate ${res.heightEstimate ? res.heightEstimate.toFixed(2) + ' m' : '-'}`,
+      tracker.locked
+        ? `lane L ${cm(lane.leftY)} R ${cm(lane.rightY)} width ${cm(lane.width)}  matched ${lane.matched.left ? 'L' : '-'}${lane.matched.right ? 'R' : '-'}  conf ${lane.confidence.toFixed(2)}`
+        : 'lane: tap Lock lane while standing in the middle of your lane',
+      estimator.initialized
+        ? `kalman eY ${cm(state.eY)} vY ${cm(state.vY)}/s ePsi ${((state.ePsi * 180) / Math.PI).toFixed(1)}° ±${cm(state.sigmaY)}  ${kf && !kf.accepted ? 'REJECTED outlier' : ''}`
+        : 'kalman: waiting for lock',
+      `control u ${cm(cmd.u)}  zone ${cmd.zone}  period ${cmd.periodMs} ms  levels [${levels.join(' ')}]`,
+      `imu age ${Number.isFinite(imuAgeMs) ? imuAgeMs.toFixed(0) + ' ms' : 'none'}  yaw rate ${((yawRate * 180) / Math.PI).toFixed(0)}°/s  belt ${belt.connected ? `on, rtt ${belt.rttMs?.toFixed(0) ?? '-'} ms, skipped ${belt.stats.skipped}` : 'off'}`,
     ].join('\n');
 
     if (video.requestVideoFrameCallback) video.requestVideoFrameCallback(frame);
@@ -185,7 +410,65 @@ function run(cv, video) {
   frame();
 }
 
-function drawView(ctx, img, detector, res) {
+// Left/right tilt of an upright phone, from gravity (gamma itself is unstable near upright).
+// + = top of the phone tilted to the right.
+const rollDeg = (up) => (Math.atan2(-up[0], up[1]) * 180) / Math.PI;
+
+// Simulation for testing the belt and practicing the cues without a lane: phone roll of
+// +-30 degrees maps to +-0.6 m of drift (+ = tilted right = runner right of center).
+function simulatedLane(gammaDeg) {
+  const eY = Math.max(-1.2, Math.min(1.2, (gammaDeg / 30) * 0.6));
+  const half = LANE_WIDTH_M / 2;
+  const center = -eY;
+  let status = LaneStatus.INSIDE;
+  if (center - half > 0) status = LaneStatus.OUTSIDE_LEFT;
+  else if (center + half < 0) status = LaneStatus.OUTSIDE_RIGHT;
+  return {
+    status, eY, ePsi: 0, center, leftY: center - half, rightY: center + half, width: LANE_WIDTH_M,
+    heading: 0, matched: { left: true, right: true }, confidence: 1,
+  };
+}
+
+// Mirrors the belt on screen: each box shows its motor's level and blinks with the 60 ms pulses
+// the firmware produces for that level.
+function showMotors(cmd, levels) {
+  const on = cmd.pattern !== Pattern.OFF && cmd.periodMs > 0 && performance.now() % cmd.periodMs < 60;
+  [...$('motors').children].forEach((el, i) => {
+    el.textContent = levels[i] ? `M${i + 1} · ${levels[i]}` : `M${i + 1}`;
+    el.classList.toggle('on', on && levels[i] > 0);
+  });
+}
+
+// Point on the line at perpendicular offset y, distance t along the lane heading.
+const alongLane = (t, y, heading) => [
+  t * Math.cos(heading) - y * Math.sin(heading),
+  t * Math.sin(heading) + y * Math.cos(heading),
+];
+
+// Locked lane painted green (like fillConvexPoly + addWeighted in the reference), centerline in yellow.
+function drawLockedLane(ctx, toScreen, lane) {
+  if (lane.status === LaneStatus.UNLOCKED || lane.status === LaneStatus.LOST) return;
+  const ts = [];
+  for (let t = 1; t <= 6; t += 0.25) ts.push(t);
+  const edge = (y) => ts.map((t) => toScreen(...alongLane(t, y, lane.heading))).filter(Boolean);
+  const left = edge(lane.leftY);
+  const right = edge(lane.rightY).reverse();
+  if (left.length > 1 && right.length > 1) {
+    ctx.fillStyle = lane.status === LaneStatus.INSIDE ? 'rgba(0, 230, 30, 0.3)' : 'rgba(255, 60, 60, 0.3)';
+    ctx.beginPath();
+    [...left, ...right].forEach(([x, y], i) => (i ? ctx.lineTo(x, y) : ctx.moveTo(x, y)));
+    ctx.closePath();
+    ctx.fill();
+  }
+  const center = edge(lane.center);
+  ctx.strokeStyle = '#fc3';
+  ctx.lineWidth = 3;
+  ctx.beginPath();
+  center.forEach(([x, y], i) => (i ? ctx.lineTo(x, y) : ctx.moveTo(x, y)));
+  ctx.stroke();
+}
+
+function drawView(ctx, img, detector, res, lane) {
   const s = 2;
   const tmp = new OffscreenCanvas(img.width, img.height);
   const tctx = tmp.getContext('2d');
@@ -201,6 +484,10 @@ function drawView(ctx, img, detector, res) {
   ctx.imageSmoothingEnabled = false;
   ctx.drawImage(tmp, 0, 0, img.width * s, img.height * s);
   if (!res.ok) return;
+  drawLockedLane(ctx, (x, y) => {
+    const px = groundToPixel(x, y, detector.K, res.basis, detector.cfg.cameraHeight);
+    return px && [px[0] * s, px[1] * s];
+  }, lane);
   ctx.strokeStyle = '#3f6';
   ctx.lineWidth = 2;
   const c = Math.cos(res.heading);
@@ -220,7 +507,7 @@ function drawView(ctx, img, detector, res) {
 }
 
 // Bird's-eye view: forward 0..5m bottom to top, lateral -3..3m.
-function drawBev(canvas, res) {
+function drawBev(canvas, res, lane) {
   const ctx = canvas.getContext('2d');
   const W = canvas.width;
   const H = canvas.height;
@@ -234,6 +521,7 @@ function drawBev(canvas, res) {
   ctx.beginPath();
   ctx.arc(sx(0), sy(0) - 4, 4, 0, 2 * Math.PI);
   ctx.fill();
+  drawLockedLane(ctx, (x, y) => [sx(y), sy(x)], lane);
   if (!res.ok) return;
   ctx.fillStyle = '#f55';
   const { points, count } = res.ground;
@@ -268,7 +556,15 @@ function drawHist(canvas, res) {
   ctx.fillRect(canvas.width / 2, 0, 1, canvas.height);
 }
 
-loadCv().then(() => { if (!$('start').hidden) $('stats').textContent = 'OpenCV ready. Tap Start.'; });
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.register('./sw.js').catch((err) => log(`offline cache unavailable: ${err.message || err}`));
+}
+
+loadCv().then(() => {
+  if (!$('start').hidden) $('stats').textContent = 'OpenCV ready. Tap Start.';
+  // ?autostart: laptop development and headless smoke tests (iOS still needs a real tap for permissions).
+  if (new URLSearchParams(location.search).has('autostart')) $('start').click();
+});
 </script>
 </body>
 </html>
