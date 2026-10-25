@@ -71,9 +71,13 @@ iPhone use **Bluefy** (Safari has no Web Bluetooth).
 
 | Page | What for |
 |---|---|
-| `web/spike-ground.html` | The app: camera + lane overlay, Lock lane, Connect belt, tuning panel |
-| `web/runner-test.html` | Belt check: manual M1-M5 buttons, BLE latency |
-| `web/record.html` | Record video + full-rate IMU on the phone, for development |
+| [The app](https://77qhtjd-bit.github.io/haptic-lane-guide/web/spike-ground.html) (`web/spike-ground.html`) | camera + lane overlay, Lock lane, Connect belt, tuning panel |
+| [Belt check](https://77qhtjd-bit.github.io/haptic-lane-guide/web/runner-test.html) (`web/runner-test.html`) | manual M1-M5 buttons, BLE latency |
+| [Recorder](https://77qhtjd-bit.github.io/haptic-lane-guide/web/record.html) (`web/record.html`) | record video + full-rate IMU on the phone, for development |
+| [Replay](https://sunuk00.github.io/haptic-lane-guide/web/replay.html) (`web/replay.html`, `phone-ble-pipeline` branch) | desktop Chrome; needs a recorded clip (`.mp4` + `.json` from the recorder; our track clips are not in the repo) |
+
+Without the phone mount the app still runs on a laptop with a webcam, but the lane geometry assumes
+a chest-mounted phone looking at the ground.
 
 Running: open `spike-ground.html` in Bluefy, tap **Connect belt** (once; it reconnects by itself),
 **Start (camera + motion)**, point the phone at the lane, tap **Lock lane**, then pick the `belt`
