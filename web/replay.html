@@ -427,7 +427,7 @@ function scoreTruth() {
     inside_cues: cueStats(inF),
     // For each real departure: seconds from its start until the belt first gives a steering or STOP cue.
     out_warning_delay_s: truthOut.map(([a, b]) => {
-      const r = rows.find((x) => x.t_s >= a && x.t_s <= b + 1 && x.motor_cue !== 'M3' && x.motor_cue !== 'OFF');
+      const r = rows.find((x) => x.t_s >= a && x.t_s <= b + 1 && (x.pattern === 'STEER' || x.pattern === 'STOP'));
       return r ? +(r.t_s - a).toFixed(2) : null;
     }),
   };
