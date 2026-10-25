@@ -1,10 +1,21 @@
 # Haptic Lane Guide
 
 A haptic belt that helps blind runners stay in their lane on an athletics track without a sighted guide.
-A chest-mounted iPhone watches the lane lines and tells a 5-motor waist belt which way to correct:
+A chest-mounted iPhone watches the lane lines and tells a vibration belt which way to correct:
 the motor's position says the direction, the pulse rate says how far off the runner is.
 
 Built at Cal Hacks 13.0 (Oct 23-25, 2026).
+
+<table>
+  <tr>
+    <td align="center"><img src="docs/images/run.gif" width="270" alt="Jogging on the track, seen by the chest-mounted iPhone"></td>
+    <td align="center"><img src="docs/images/app.gif" width="300" alt="The app: locked lane in green, curve cue, belt preview with M2 pulsing"></td>
+  </tr>
+  <tr>
+    <td align="center">What the chest-mounted phone sees (jogging, real track)</td>
+    <td align="center">The app on the same footage: locked lane, <b>◀ CURVE</b> cue, M2 pulsing</td>
+  </tr>
+</table>
 
 ## How it works
 
@@ -26,19 +37,19 @@ Everything runs on the phone; no laptop or network is needed while running.
 3. **Filter** (`web/control/estimator.js`): Kalman filter on offset, lateral speed and heading, with
    the gyro as the prediction between camera frames.
 4. **Belt cue** (`web/control/controller.js`): position and heading are averaged over the running
-   stride and mapped to one of five motors:
+   stride and mapped to the belt's motors:
 
    | Motor | Meaning | Pulse period |
    |---|---|---|
    | M1 / M5 | big turn left / right | 350 ms |
    | M2 / M4 | small turn left / right | 600 ms |
-   | M3 | centered, "heartbeat" | 1000 ms |
+   | M3 | centered, "heartbeat" (not fitted on our belt, so centered = no vibration) | 1000 ms |
    | M2 on a left bend | keep turning with the curve (announced by a double tap) | 800 ms |
    | M1 + M5 | stop (lane lost) | 300 ms |
 
    A new cue must persist briefly before it is sent and is then kept at least 1.5 s, so stride-by-stride
    noise does not reach the belt.
-5. **Belt** (`firmware/lane_actuator_ble/`): the phone sends 5 motor levels over Bluetooth LE at
+5. **Belt** (`firmware/lane_actuator_ble/`): the phone sends 5 motor levels (M1..M5) over Bluetooth LE at
    ~20 Hz; the R4 turns each level into 200 ms vibration pulses and stops every motor if no command
    arrives for 300 ms.
 
@@ -71,7 +82,7 @@ iPhone use **Bluefy** (Safari has no Web Bluetooth).
 
 | Page | What for |
 |---|---|
-| [The app](https://77qhtjd-bit.github.io/haptic-lane-guide/web/spike-ground.html) (`web/spike-ground.html`) | camera + lane overlay, Lock lane, Connect belt, tuning panel |
+| [The app](https://77qhtjd-bit.github.io/haptic-lane-guide/web/spike-ground.html) (`web/spike-ground.html`) | camera + lane overlay, Lock lane, Connect belt, motor test, run recording, tuning panel |
 | [Belt check](https://77qhtjd-bit.github.io/haptic-lane-guide/web/runner-test.html) (`web/runner-test.html`) | manual M1-M5 buttons, BLE latency |
 | [Recorder](https://77qhtjd-bit.github.io/haptic-lane-guide/web/record.html) (`web/record.html`) | record video + full-rate IMU on the phone, for development |
 | [Replay](https://sunuk00.github.io/haptic-lane-guide/web/replay.html) (`web/replay.html`, `phone-ble-pipeline` branch) | desktop Chrome; needs a recorded clip (`.mp4` + `.json` from the recorder; our track clips are not in the repo) |
@@ -79,11 +90,18 @@ iPhone use **Bluefy** (Safari has no Web Bluetooth).
 Without the phone mount the app still runs on a laptop with a webcam, but the lane geometry assumes
 a chest-mounted phone looking at the ground.
 
-Running: open `spike-ground.html` in Bluefy, tap **Connect belt** (once; it reconnects by itself),
-**Start (camera + motion)**, point the phone at the lane, tap **Lock lane**, then pick the `belt`
-condition and **Start run**. Camera height (default 1.5 m) and the white thresholds (Vmin/Smax) are
-inputs at the top; every rule can be changed in the **Tuning** panel at the bottom or from the
-address (`?t_<key>=..` tracker, `?c_<key>=..` belt cue).
+Running: open `spike-ground.html` in Bluefy and tap **1. Connect belt** (once; it reconnects by
+itself), **2. Start camera + motion**, stand in your lane and tap **3. Lock lane**. Two short taps on
+the belt confirm the lock, and from then on the belt guides you (**Belt ON / PAUSED** to pause it).
+Tap a motor in the belt preview to test it. The screen is kept on while running (otherwise set
+Auto-Lock to Never). **Record clip** saves the run's video + IMU for the replay demo. Line color
+(Vmin/Smax), camera height (default 1.5 m) and every rule are under **Advanced**, or in the address
+(`?t_<key>=..` tracker, `?c_<key>=..` belt cue).
+
+Replay demo: open `replay.html` in desktop Chrome, pick a recorded `.mp4` + `.json`, **Connect belt**,
+and play; the screen shows the lane and belt cues while the real belt vibrates. On Linux, Chrome needs
+`chrome://flags/#enable-experimental-web-platform-features` enabled for Bluetooth, and the phone must
+let go of the belt first (it accepts one connection).
 
 Development tools on the `phone-ble-pipeline` branch: `web/replay.html` plays a recorded clip through
 the full pipeline in desktop Chrome (frame-by-frame mode, scoring against hand-marked departures, belt
@@ -91,9 +109,12 @@ preview, and it can drive the real belt for indoor demos); `laptop/` holds the t
 
 ## Hardware
 
-- Arduino UNO R4 WiFi, 5 coin vibration motors around the waist (left to right M1..M5) switched
-  from pins D2-D6 (or A1-A5, one `#define` in the sketch). Coin motors need ~200 ms to be felt,
-  which sets the pulse length.
+<!-- Hardware photo: docs/images/belt.jpg -->
+
+- Arduino UNO R4 WiFi and coin vibration motors around the waist: M1, M2 on the left, M4, M5 on the
+  right, switched from pins D2-D6 (or A1-A5, one `#define` in the sketch). The center motor M3 is in
+  the protocol but not fitted on our belt (we ran out of budget), so "centered" is felt as silence.
+- Coin motors need ~200 ms to be felt, which sets the pulse length.
 - The R4's LED matrix shows one bar per motor while it pulses.
 - iPhone in a chest mount at ~70° pitch, about 1.5 m above the ground.
 
