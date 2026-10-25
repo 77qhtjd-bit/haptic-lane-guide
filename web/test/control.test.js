@@ -183,7 +183,7 @@ test('controller: stride sway (1.4 Hz) is averaged out instead of flipping the b
     const w = Math.sin(2 * Math.PI * 1.4 * (t / 1000));
     cues.push(ctl.step({ eY: 0.05 + 0.15 * w, vY: 0, ePsi: 15 * DEG * w }, LaneStatus.INSIDE, 0, t).motors);
   }
-  const settled = cues.slice(30);
+  const settled = cues.slice(45); // after the averaging window has filled (and any start-up cue its hold)
   assert.ok(settled.every((m) => m === motorBit(3)), 'heartbeat only once the window is full');
 });
 
@@ -207,7 +207,7 @@ test('curve guidance: centered on a left bend gives a double tap, then gentle pu
   const cues = [];
   for (let i = 30; i < 150; i++) cues.push(at(i, -1 / 40)); // track bend to the left (R 40 m)
   const first = cues.findIndex((c) => c.pattern === Pattern.CURVE);
-  assert.ok(first >= 0 && first <= 30, `curve cue within ~1 s (frame ${first})`);
+  assert.ok(first >= 0 && first <= 45, `curve cue within ~1.5 s (frame ${first})`);
   assert.equal(cues[first].motors, motorBit(2));
   assert.equal(cues[first].periodMs, ctl.cfg.curveStartPeriodMs); // double tap at the start
   const last = cues[cues.length - 1];
@@ -231,4 +231,36 @@ test('curve guidance: drifting outward on the bend strengthens the left cue; rig
   const both = new HapticController({ curveSides: 0 });
   for (let i = 0; i < 90; i++) cmd = both.step({ eY: 0, vY: 0, ePsi: 0 }, LaneStatus.INSIDE, 1 / 40, (i * 1000) / 30);
   assert.equal(cmd.motors, motorBit(4));
+});
+
+test('cue dwell: a 0.2 s blip of another cue is not sent; a lasting one is; urgent cues come fast', () => {
+  // Averaging off so the raw cue follows the input directly; only the dwell is tested.
+  const ctl = new HapticController({ positionAvgS: 0, headingAvgS: 0, headingBiasS: 0 });
+  const at = (i, eY) => ctl.step({ eY, vY: 0, ePsi: 0 }, LaneStatus.INSIDE, 0, (i * 1000) / 30);
+  let cmd;
+  for (let i = 0; i < 60; i++) cmd = at(i, 0);
+  assert.equal(cmd.pattern, Pattern.HEARTBEAT);
+  // 0.2 s at 30 cm right of center (raw small-left), then centered: nothing else is sent.
+  const sent = [];
+  for (let i = 60; i < 66; i++) sent.push(at(i, 0.3).pattern);
+  for (let i = 66; i < 120; i++) sent.push(at(i, 0).pattern);
+  assert.ok(sent.every((p) => p === Pattern.HEARTBEAT), 'blip filtered');
+  // Lasting 30 cm: the small-left cue after cueConfirmS (0.35 s, about 11 frames).
+  let t;
+  for (t = 120; t < 180; t++) { cmd = at(t, 0.3); if (cmd.motors === motorBit(2)) break; }
+  assert.ok(t - 120 >= 9 && t - 120 <= 13, `small cue after ${t - 120} frames`);
+  // Then 50 cm: the big-left cue fast (cueEscalateS 0.15 s), no hold needed.
+  for (t = 180; t < 240; t++) { cmd = at(t, 0.5); if (cmd.motors === motorBit(1)) break; }
+  assert.ok(t - 180 <= 6, `big cue after ${t - 180} frames`);
+});
+
+test('cue dwell off (all 0) sends every raw cue as before', () => {
+  const ctl = new HapticController({ cueConfirmS: 0, cueEscalateS: 0, cueHoldS: 0 });
+  const raw = new HapticController({ cueConfirmS: 0, cueEscalateS: 0, cueHoldS: 0 });
+  for (let i = 0; i < 90; i++) {
+    const st = { eY: 0.3 * Math.sin(i / 3), vY: 0, ePsi: 0 };
+    const a = ctl.step(st, LaneStatus.INSIDE, 0, (i * 1000) / 30);
+    const b = raw.rawStep(st, LaneStatus.INSIDE, 0, (i * 1000) / 30);
+    assert.equal(a.motors, b.motors, `frame ${i}`);
+  }
 });

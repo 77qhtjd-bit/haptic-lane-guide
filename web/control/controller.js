@@ -54,7 +54,25 @@ export const DEFAULT_CONTROL_CONFIG = {
   curvePeriodMs: 800, // gentle pulses while centered on a bend
   curveStartMs: 400, // the first curveStartMs of a bend: fast pulses (a double tap)
   curveStartPeriodMs: 150,
+  // Cue dwell (needs frame times): a 0.1-0.3 s blip of another cue is one stray pulse that only
+  // confuses the runner (jogging clip: 30 cue episodes under 0.3 s in 3 min, mostly small-left blips
+  // on bends). A new cue is sent only after it has persisted cueConfirmS; a more urgent one
+  // (small -> big turn, outside, stop) after cueEscalateS; the cue being sent is kept at least
+  // cueHoldS (one pulse at least) before a calmer one replaces it. 0 = off for each.
+  cueConfirmS: 0.35, // 0.4 delayed one real departure warning to 0.52 s; 0.35 kept all <= 0.49 s, blips still 0
+  cueEscalateS: 0.15,
+  cueHoldS: 0.8,
 };
+
+// Urgency of a command for the cue dwell: calm cues < small turn < big turn < stop.
+function urgency(cmd) {
+  if (cmd.pattern === Pattern.STOP) return 4;
+  if (cmd.pattern === Pattern.STEER) return cmd.zone === 2 ? 3 : 2;
+  if (cmd.pattern === Pattern.OFF) return 0;
+  return 1; // heartbeat, curve guidance
+}
+const cueKey = (cmd) => `${cmd.pattern}:${cmd.motors}`;
+const cueSide = (cmd) => (cmd.motors & 0b00011 ? -1 : cmd.motors & 0b11000 ? 1 : 0);
 
 export class HapticController {
   constructor(config = {}) {
@@ -88,7 +106,6 @@ export class HapticController {
     if (want === this.curveSide) { this.curvePending = null; return; }
     if (this.curvePending !== want) { this.curvePending = want; this.curvePendingSince = tMs; return; }
     if (tMs - this.curvePendingSince >= c.curveHoldS * 1000) {
-      if (want !== 0) this.curveStartUntil = tMs + c.curveStartMs;
       this.curveSide = want;
       this.curvePending = null;
     }
@@ -140,6 +157,40 @@ export class HapticController {
   // tMs: frame time (ms); when given, eY and ePsi are averaged as described in the config.
   // lowConfidence (just re-locked): the cue stays at most in the small-turn zone.
   step(state, status, curvature = 0, tMs = null, lowConfidence = false) {
+    const raw = this.rawStep(state, status, curvature, tMs, lowConfidence);
+    return tMs == null ? raw : this.dwell(raw, tMs);
+  }
+
+  // Cue dwell (see cueConfirmS / cueEscalateS / cueHoldS) and the curve double tap.
+  dwell(raw, tMs) {
+    const c = this.cfg;
+    const sent = this.sentCue;
+    let next = sent;
+    if (!sent) next = { cmd: raw, since: tMs };
+    else if (cueKey(raw) === cueKey(sent.cmd)) {
+      next = { cmd: raw, since: sent.since }; // same cue: follow its period/level changes
+      this.pendingCue = null;
+    } else {
+      if (!this.pendingCue || this.pendingCue.key !== cueKey(raw)) this.pendingCue = { key: cueKey(raw), since: tMs };
+      // Fast only toward the urgent cues (big turn, outside, stop); small-turn blips are the usual noise.
+      const escalate = urgency(raw) >= 3 && urgency(raw) > urgency(sent.cmd) && cueSide(raw) * cueSide(sent.cmd) >= 0;
+      const confirm = escalate ? c.cueEscalateS : c.cueConfirmS;
+      const held = escalate || tMs - sent.since >= c.cueHoldS * 1000;
+      if (held && tMs - this.pendingCue.since >= confirm * 1000) {
+        next = { cmd: raw, since: tMs };
+        this.pendingCue = null;
+      }
+    }
+    if (next !== sent && next.cmd.pattern === Pattern.CURVE && (!sent || sent.cmd.pattern !== Pattern.CURVE)) {
+      this.curveStartUntil = tMs + c.curveStartMs; // the curve cue starts now: double tap
+    }
+    this.sentCue = next;
+    const out = { ...next.cmd, rawPattern: raw.pattern };
+    if (out.pattern === Pattern.CURVE && tMs < this.curveStartUntil) out.periodMs = c.curveStartPeriodMs;
+    return out;
+  }
+
+  rawStep(state, status, curvature = 0, tMs = null, lowConfidence = false) {
     const c = this.cfg;
     if (status === LaneStatus.UNLOCKED || status === LaneStatus.LOST) this.reset();
     if (status === LaneStatus.UNLOCKED) {
@@ -179,7 +230,7 @@ export class HapticController {
         pattern: Pattern.CURVE,
         motors: motorBit(this.curveSide < 0 ? 2 : 4),
         level: c.weakLevel,
-        periodMs: tMs < this.curveStartUntil ? c.curveStartPeriodMs : c.curvePeriodMs,
+        periodMs: c.curvePeriodMs, // the double tap at the start is added when the cue is sent (see dwell)
         zone: 0,
         u,
         curve: this.curveSide,
