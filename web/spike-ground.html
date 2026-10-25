@@ -76,6 +76,7 @@
   <span>(used only when the device sends no orientation, e.g. a laptop webcam)</span>
 </div>
 <div id="overrides" style="font-size:12px;color:#9cf"></div>
+<details id="tuningBox"><summary style="font-size:16px;padding:6px 0">Tuning (rules and belt cue)</summary><div id="tuning"></div></details>
 <div id="log"></div>
 <video id="video" playsinline muted></video>
 <canvas id="proc" hidden></canvas>
@@ -90,6 +91,7 @@ import { HapticController, Pattern } from './control/controller.js';
 import { BeltLink, commandToLevels } from './control/protocol.js';
 import { RunLogger, Condition } from './control/logger.js';
 import { AudioCue } from './control/audio.js';
+import { setupTuning } from './control/tuning.js';
 
 const $ = (id) => document.getElementById(id);
 const logEl = $('log');
@@ -107,12 +109,8 @@ for (const [k, v] of urlParams) {
   if (k.startsWith('c_')) controlOverrides[k.slice(2)] = +v;
 }
 for (const id of ['h', 'hfov', 'vmin', 'smax', 'lag', 'laneMin', 'laneMax']) if (urlParams.get(id)) $(id).value = urlParams.get(id);
-{
-  const shown = [...Object.entries(trackerOverrides).map(([k, v]) => `tracker.${k}=${v}`),
-                 ...Object.entries(controlOverrides).map(([k, v]) => `control.${k}=${v}`)];
-  $('overrides').textContent = shown.length ? `settings from the address: ${shown.join('  ')}` : 'all rules at their defaults';
-  if (shown.length) log(`settings from the address: ${shown.join(', ')}`);
-}
+// On-page tuning panel (below): changes apply at once; saved on this phone; address values win.
+let liveTracker = null;
 window.addEventListener('error', (e) => log(`error: ${e.message}`));
 window.addEventListener('unhandledrejection', (e) => log(`rejection: ${e.reason}`));
 
@@ -149,6 +147,13 @@ window.addEventListener('deviceorientation', (e) => {
 const IMU_STALE_MS = 100;
 const estimator = new LaneEstimator();
 const controller = new HapticController(controlOverrides);
+setupTuning($('tuning'), {
+  overrides: { t: trackerOverrides, c: controlOverrides },
+  getTracker: () => liveTracker,
+  getController: () => controller,
+  storageKey: 'lane-guide-tuning',
+  onChange: (text) => { $('overrides').textContent = text; },
+});
 let lastMotionT = -Infinity;
 let lastPredictT = null;
 let yawRate = 0;
@@ -310,6 +315,7 @@ function run(cv, video) {
   let prevHeading = 0;
   let latest = null;
   const tracker = new LaneTracker(trackerOverrides);
+  liveTracker = tracker;
   $('lock').hidden = false;
   $('lock').onclick = () => {
     const ok = latest?.ok && tracker.lock(latest.peaks, latest.heading, latest.segments);
