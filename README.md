@@ -125,8 +125,16 @@ preview, and it can drive the real belt for indoor demos); `laptop/` holds the t
 
 ## Hardware
 
-<p align="center"><img src="docs/images/hardware.jpg" width="420" alt="Chest harness with a 3D-printed phone mount (left) and the waist belt with coin vibration motors and breadboard wiring (right)"></p>
-<p align="center">Left: chest harness with our 3D-printed phone mount. Right: the waist belt, coin motors (two per side) wired through a breadboard to the Arduino.</p>
+<table>
+  <tr>
+    <td align="center"><img src="docs/images/hardware.jpg" width="330" alt="Chest harness with a 3D-printed phone mount and the waist belt with coin vibration motors and breadboard wiring"></td>
+    <td align="center"><img src="docs/images/running_pose.jpg" width="330" alt="A teammate wearing the chest-mounted phone and the haptic belt at Cal Hacks 13.0"></td>
+  </tr>
+  <tr>
+    <td align="center">The hardware: chest harness with our 3D-printed phone mount (left), waist belt with coin motors (two per side) wired through a breadboard to the Arduino (right)</td>
+    <td align="center">Worn at Cal Hacks 13.0: phone on the chest, belt around the waist</td>
+  </tr>
+</table>
 
 
 - Arduino UNO R4 WiFi and coin vibration motors around the waist: M1, M2 on the left, M4, M5 on the
