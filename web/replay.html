@@ -279,6 +279,8 @@ function processFrame(mediaTime) {
     u_m: cmd.u, zone: cmd.zone, cue: cue.replace(/[◀▶]/g, '').trim(),
     L1: levels[0], L2: levels[1], L3: levels[2], L4: levels[3], L5: levels[4],
     motor_cue: motorCue(levels),
+    pattern: ['OFF', 'STEER', 'HEARTBEAT', 'STOP', 'CURVE'][cmd.pattern] ?? cmd.pattern,
+    curve_side: controller.curveSide ?? 0,
     imu_age_ms: Number.isFinite(imuAgeMs) ? Math.round(imuAgeMs) : '',
     beta: lastOrientation?.beta ?? '', gamma: lastOrientation?.gamma ?? '',
     height_est_m: res.heightEstimate ?? '', mask_px: res.maskPixels ?? '', proc_ms: +procMs.toFixed(2),
