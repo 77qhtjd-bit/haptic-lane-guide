@@ -33,6 +33,8 @@
   #belt .m { flex: 1; height: 54px; border-radius: 10px; background: #222; color: #777; display: flex; flex-direction: column;
              align-items: center; justify-content: center; font: 700 15px system-ui; border: 2px solid #333; }
   #belt .m small { font-weight: 400; font-size: 11px; }
+  #belt .m { cursor: pointer; -webkit-tap-highlight-color: transparent; }
+  .hint { color: #888; font-size: 12px; margin-top: 6px; }
   #belt .m.armed { border-color: #666; color: #ccc; }
   /* Active motor between pulses: dim tint of its cue color, so the active motor is always visible. */
   #belt .m.armed.HEARTBEAT { background: #123d1d; } #belt .m.armed.CURVE { background: #12384a; }
@@ -51,6 +53,7 @@
 <div id="status"></div>
 <div id="tilt" hidden></div>
 <div id="wake" hidden></div>
+<div class="hint">Tap a motor to test it (on for 1 s)</div>
 <div id="belt"></div>
 <div id="beltCue"></div>
 <button id="beltToggle">Belt ON (tap to pause)</button>
@@ -262,6 +265,7 @@ $('start').onclick = async () => {
 };
 
 function run(cv, video) {
+  frameLoop = true;
   const procWidth = DEFAULT_CONFIG.procWidth;
   const procHeight = Math.round((procWidth * video.videoHeight) / video.videoWidth);
   log(`video ${video.videoWidth}x${video.videoHeight} -> proc ${procWidth}x${procHeight}`);
@@ -358,10 +362,11 @@ function run(cv, video) {
     const state = estimator.initialized ? estimator.state : { eY: lane.eY ?? 0, vY: 0, ePsi: lane.ePsi ?? 0 };
     const cmd = controller.step(state, lane.status, lane.curvature ?? 0, performance.now(), !!lane.lowConfidence);
     const levels = commandToLevels(cmd);
-    const sent = !beltOn ? [0, 0, 0, 0, 0] : lockTapLevels(performance.now()) ?? levels;
+    const test = testLevels(performance.now());
+    const sent = test ?? (!beltOn ? [0, 0, 0, 0, 0] : lockTapLevels(performance.now()) ?? levels);
     belt.send(sent); // all-zero when paused, so the board keeps a live link
     const cue = cueText(cmd, tracker.locked, !!candidate);
-    showBelt(sent, cmd, performance.now(), beltOn ? cue : 'belt paused');
+    showBelt(sent, cmd, performance.now(), test ? testCue : beltOn ? cue : 'belt paused');
     const procMs = performance.now() - t0;
 
     const now = performance.now();
@@ -421,6 +426,31 @@ const motorEls = [1, 2, 3, 4, 5].map((n) => {
   return el;
 });
 const pulseStart = [null, null, null, null, null];
+
+// Motor test: tap a box to run that motor for 1 s (also before Start, when no frame loop sends).
+const TEST_MS = 1000;
+let frameLoop = false;
+let test = null; // { levels, until }
+let testCue = '';
+const testLevels = (now) => (test && now < test.until ? test.levels : null);
+motorEls.forEach((el, i) => {
+  el.onclick = () => {
+    if (!belt.connected) log('belt not connected: tap 1. Connect belt first');
+    const levels = [0, 0, 0, 0, 0];
+    levels[i] = 255;
+    test = { levels, until: performance.now() + TEST_MS };
+    testCue = `M${i + 1} test`;
+    if (frameLoop) return; // the frame loop sends it
+    const timer = setInterval(() => {
+      const now = performance.now();
+      const lv = testLevels(now) ?? [0, 0, 0, 0, 0];
+      belt.send(lv);
+      showBelt(lv, { pattern: 0, zone: 0 }, now, testLevels(now) ? testCue : '');
+      if (!testLevels(now)) clearInterval(timer);
+    }, 50);
+  };
+});
+
 function showBelt(levels, cmd, tMs, cue) {
   const pattern = ['OFF', 'STEER', 'HEARTBEAT', 'STOP', 'CURVE'][cmd.pattern] ?? '';
   levels.forEach((lv, i) => {
