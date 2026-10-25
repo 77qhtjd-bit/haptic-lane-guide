@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>Ground Spike</title>
+<title>Haptic Lane Guide</title>
 <style>
   body { margin: 0; padding: 12px; font: 13px/1.4 -apple-system, system-ui, sans-serif; background: #111; color: #eee; }
   button { font-size: 18px; padding: 14px 20px; width: 100%; border-radius: 10px; border: 0; background: #2d7; color: #000; }
@@ -20,44 +20,49 @@
   #tilt { background: #f93; color: #000; font-weight: 700; padding: 8px; border-radius: 8px; margin: 4px 0; }
   #status.outside-left, #status.outside-right, #status.lost { color: #f55; }
   #connect { margin-top: 8px; background: #39f; }
-  #motors { display: flex; gap: 6px; margin: 8px 0; }
-  #motors div { flex: 1; text-align: center; padding: 10px 0; border-radius: 8px; background: #333; font-weight: 700; }
-  #motors div.on { background: #fc3; color: #000; }
-  #runs { border: 1px solid #444; border-radius: 10px; padding: 8px; margin: 8px 0; }
-  #runs select, #runs button { font-size: 16px; padding: 10px; }
-  #runs button { width: auto; flex: 1; }
-  #runTable { width: 100%; border-collapse: collapse; font-family: ui-monospace, monospace; }
-  #runTable td, #runTable th { border-bottom: 1px solid #333; padding: 2px 4px; text-align: right; }
-  #csvOut { width: 100%; height: 120px; font-family: ui-monospace, monospace; font-size: 11px; }
+  #view { width: 100%; }
+  #beltToggle { margin: 4px 0 8px; background: #2d7; }
+  #beltToggle.paused { background: #555; color: #fff; }
+  #wake { background: #333; color: #fc3; padding: 8px; border-radius: 8px; margin: 4px 0; }
+  #log { max-height: 60px; }
+  details.adv { margin-top: 10px; border-top: 1px solid #333; }
+  details.adv > summary { font-size: 16px; padding: 8px 0; }
+  /* Belt preview (same as replay.html): M1..M5 left to right as worn; lit during each firmware pulse
+     (200 ms, <= 2/3 period). Colors: green heartbeat, cyan curve guidance, yellow small turn, red big turn/stop. */
+  #belt { display: flex; gap: 6px; margin: 6px 0; }
+  #belt .m { flex: 1; height: 54px; border-radius: 10px; background: #222; color: #777; display: flex; flex-direction: column;
+             align-items: center; justify-content: center; font: 700 15px system-ui; border: 2px solid #333; }
+  #belt .m small { font-weight: 400; font-size: 11px; }
+  #belt .m.armed { border-color: #666; color: #ccc; }
+  /* Active motor between pulses: dim tint of its cue color, so the active motor is always visible. */
+  #belt .m.armed.HEARTBEAT { background: #123d1d; } #belt .m.armed.CURVE { background: #12384a; }
+  #belt .m.armed.STEER { background: #4a4010; } #belt .m.armed.STEER.big, #belt .m.armed.STOP { background: #4a1612; }
+  #belt .m.on.HEARTBEAT { background: #30d158; color: #000; }
+  #belt .m.on.CURVE { background: #64d2ff; color: #000; }
+  #belt .m.on.STEER { background: #ffd60a; color: #000; }
+  #belt .m.on.STEER.big, #belt .m.on.STOP { background: #ff453a; color: #fff; }
+  #beltCue { font: 700 18px system-ui; margin: 0 0 4px 2px; }
 </style>
 </head>
 <body>
-<button id="start">Start (camera + motion)</button>
-<button id="lock" hidden>Lock lane</button>
-<button id="connect">Connect belt (BLE: LaneActuator)</button>
+<button id="connect">1. Connect belt (BLE: LaneActuator)</button>
+<button id="start" style="margin-top:8px">2. Start camera + motion</button>
+<button id="lock" hidden>3. Lock lane</button>
 <div id="status"></div>
 <div id="tilt" hidden></div>
-<div id="motors"><div>1</div><div>2</div><div>3</div><div>4</div><div>5</div></div>
-<div id="runs">
-  <div class="row">
-    <select id="condition">
-      <option value="belt">belt</option>
-      <option value="audio">audio</option>
-      <option value="none">no feedback</option>
-    </select>
-    <button id="runBtn">Start run</button>
-  </div>
-  <table id="runTable"></table>
-  <div class="row">
-    <button id="csvDownload">Download CSV</button>
-    <button id="csvCopy">Copy CSV</button>
-    <button id="csvShow">Show CSV</button>
-    <button id="runsClear">Clear runs</button>
-  </div>
-  <textarea id="csvOut" hidden readonly></textarea>
+<div id="wake" hidden></div>
+<div id="belt"></div>
+<div id="beltCue"></div>
+<button id="beltToggle">Belt ON (tap to pause)</button>
+<canvas id="view"></canvas>
+<div id="log"></div>
+<details class="adv"><summary>Advanced (line color, camera, tuning, debug)</summary>
+<div class="row">
+  <label>Vmin <input id="vmin" type="number" step="5" value="180"></label>
+  <label>Smax <input id="smax" type="number" step="5" value="60"></label>
+  <span>white = brightness &ge; Vmin and saturation &le; Smax (lines missed: Vmin 160 or Smax 70)</span>
 </div>
 <div class="row">
-  <canvas id="view"></canvas>
   <canvas id="bev" width="240" height="320"></canvas>
 </div>
 <canvas id="hist" width="480" height="80"></canvas>
@@ -65,8 +70,6 @@
 <div class="row">
   <label>h(m) <input id="h" type="number" step="0.05" value="1.5"></label>
   <label>hfov <input id="hfov" type="number" step="1" value="53"></label>
-  <label>Vmin <input id="vmin" type="number" step="5" value="180"></label>
-  <label>Smax <input id="smax" type="number" step="5" value="60"></label>
   <label>lag(ms) <input id="lag" type="number" step="10" value="50"></label>
   <label>lane width(m) <input id="laneMin" type="number" step="0.05" value="0.6"> ~ <input id="laneMax" type="number" step="0.05" value="1.3"></label>
 </div>
@@ -77,7 +80,7 @@
 </div>
 <div id="overrides" style="font-size:12px;color:#9cf"></div>
 <details id="tuningBox"><summary style="font-size:16px;padding:6px 0">Tuning (rules and belt cue)</summary><div id="tuning"></div></details>
-<div id="log"></div>
+</details>
 <video id="video" playsinline muted></video>
 <canvas id="proc" hidden></canvas>
 
@@ -89,8 +92,6 @@ import { LaneTracker, LaneStatus } from './lane/tracker.js';
 import { LaneEstimator, yawRateFromMotion } from './control/estimator.js';
 import { HapticController, Pattern } from './control/controller.js';
 import { BeltLink, commandToLevels } from './control/protocol.js';
-import { RunLogger, Condition } from './control/logger.js';
-import { AudioCue } from './control/audio.js';
 import { setupTuning } from './control/tuning.js';
 
 const $ = (id) => document.getElementById(id);
@@ -178,80 +179,44 @@ const belt = new BeltLink({
 });
 if (navigator.bluetooth) belt.restore().catch((err) => log(`belt restore: ${err.message || err}`));
 else $('connect').textContent = 'No Web Bluetooth (open in Bluefy)';
-const audioCue = new AudioCue();
+// The belt vibrates whenever a lane is locked, unless paused here (explaining, resting).
+let beltOn = true;
+$('beltToggle').onclick = () => {
+  beltOn = !beltOn;
+  $('beltToggle').textContent = beltOn ? 'Belt ON (tap to pause)' : 'Belt PAUSED (tap to resume)';
+  $('beltToggle').classList.toggle('paused', !beltOn);
+};
 
-// Runs for the proof chart: same lane, walked under each condition; compare RMS of eY.
-const logger = new RunLogger();
-const cm1 = (m) => (Number.isFinite(m) ? (m * 100).toFixed(1) : '-');
-function renderRuns() {
-  const head = '<tr><th>#</th><th>cond</th><th>s</th><th>RMS cm</th><th>max cm</th><th>inside %</th><th>tracked %</th></tr>';
-  $('runTable').innerHTML = head + logger.runs.map((r, i) => {
-    const s = r.summary;
-    return `<tr><td>${i + 1}</td><td>${r.condition}</td><td>${s.durationS.toFixed(0)}</td><td>${cm1(s.rmsEyKf)}</td>` +
-      `<td>${cm1(s.maxAbsEy)}</td><td>${s.insidePct.toFixed(0)}</td><td>${s.trackedPct.toFixed(0)}</td></tr>`;
-  }).join('');
+// Lock confirmation: two short taps on M3 (the runner cannot see the screen).
+const LOCK_TAPS = [[0, 200], [400, 600]]; // ms after the lock: motor on in these windows
+let lockedAt = -Infinity;
+function lockTapLevels(now) {
+  const dt = now - lockedAt;
+  if (dt > LOCK_TAPS[LOCK_TAPS.length - 1][1]) return null;
+  return LOCK_TAPS.some(([a, b]) => dt >= a && dt < b) ? [0, 0, 255, 0, 0] : [0, 0, 0, 0, 0];
 }
-renderRuns();
-$('runBtn').onclick = () => {
-  if (logger.recording) {
-    const run = logger.stop();
-    $('runBtn').textContent = 'Start run';
-    $('condition').disabled = false;
-    log(run ? `run saved: ${run.condition}, RMS ${cm1(run.summary.rmsEyKf)} cm` : 'run had no frames');
-    renderRuns();
-  } else {
-    logger.start($('condition').value);
-    $('runBtn').textContent = 'Stop run';
-    $('condition').disabled = true;
-  }
-};
-// Bluefy blocks download links; the iOS share sheet ("Save to Files") works there, as in
-// record.html. Download links remain the fallback for browsers without file sharing.
-$('csvDownload').textContent = 'Save CSV';
-$('csvDownload').onclick = async () => {
-  const name = `lane-runs-${new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14)}.csv`;
-  const file = new File([logger.toCsv()], name, { type: 'text/csv' });
-  if (navigator.canShare && navigator.canShare({ files: [file] })) {
-    try {
-      await navigator.share({ files: [file], title: name });
-      log(`CSV shared: ${name}`);
-    } catch (err) {
-      if (err.name !== 'AbortError') log(`share failed (${err.name} ${err.message}); use Copy CSV or Show CSV`);
-    }
+
+// Keep the screen on while running: with the screen off iOS stops the camera.
+let wakeLock = null;
+async function keepScreenOn() {
+  if (!('wakeLock' in navigator)) {
+    $('wake').hidden = false;
+    $('wake').textContent = 'This browser cannot keep the screen on: set Settings > Display & Brightness > Auto-Lock to Never.';
     return;
   }
-  const url = URL.createObjectURL(file);
-  const a = Object.assign(document.createElement('a'), { href: url, download: name });
-  document.body.append(a);
-  a.click();
-  a.remove();
-  setTimeout(() => URL.revokeObjectURL(url), 1000);
-};
-$('csvCopy').onclick = async () => {
   try {
-    await navigator.clipboard.writeText(logger.toCsv());
-    log('CSV copied');
+    wakeLock = await navigator.wakeLock.request('screen');
+    $('wake').hidden = true;
+    log('screen kept on');
   } catch (err) {
-    log(`copy failed (${err.message || err}); use Show CSV`);
+    $('wake').hidden = false;
+    $('wake').textContent = `Screen may turn off (${err.name}): set Auto-Lock to Never.`;
   }
-};
-$('csvShow').onclick = () => {
-  $('csvOut').hidden = !$('csvOut').hidden;
-  $('csvOut').value = logger.toCsv();
-};
-let clearArmed = false;
-$('runsClear').onclick = () => {
-  if (!clearArmed) {
-    clearArmed = true;
-    $('runsClear').textContent = 'Tap again to clear';
-    setTimeout(() => { clearArmed = false; $('runsClear').textContent = 'Clear runs'; }, 3000);
-    return;
-  }
-  logger.clear();
-  renderRuns();
-  clearArmed = false;
-  $('runsClear').textContent = 'Clear runs';
-};
+}
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible' && wakeLock !== null) keepScreenOn();
+});
+
 $('connect').onclick = async () => {
   try {
     await belt.choose();
@@ -274,7 +239,7 @@ const std = (a) => {
 
 $('start').onclick = async () => {
   try {
-    audioCue.start(); // must happen inside the tap, before any await
+    keepScreenOn(); // inside the tap, before any await
     if (typeof DeviceOrientationEvent !== 'undefined' && DeviceOrientationEvent.requestPermission) {
       log(`orientation permission: ${await DeviceOrientationEvent.requestPermission()}`);
     }
@@ -323,6 +288,7 @@ function run(cv, video) {
       controller.zone = 0;
       estimator.reset(tracker.last.eY, tracker.last.ePsi);
       lastPredictT = performance.now();
+      lockedAt = performance.now();
     }
     log(ok
       ? `locked: width ${(tracker.width * 100).toFixed(0)} cm`
@@ -391,37 +357,11 @@ function run(cv, video) {
     }
     const state = estimator.initialized ? estimator.state : { eY: lane.eY ?? 0, vY: 0, ePsi: lane.ePsi ?? 0 };
     const cmd = controller.step(state, lane.status, lane.curvature ?? 0, performance.now(), !!lane.lowConfidence);
-    // The belt only vibrates in belt runs; it still gets all-zero commands otherwise, so the board keeps a live link.
-    const condition = $('condition').value;
     const levels = commandToLevels(cmd);
-    belt.send(condition === Condition.BELT ? levels : [0, 0, 0, 0, 0]);
-    audioCue.update(cmd, condition === Condition.AUDIO);
-    showMotors(cmd, levels);
+    const sent = !beltOn ? [0, 0, 0, 0, 0] : lockTapLevels(performance.now()) ?? levels;
+    belt.send(sent); // all-zero when paused, so the board keeps a live link
     const cue = cueText(cmd, tracker.locked, !!candidate);
-    logger.record({
-      status: lane.status,
-      confidence: lane.confidence ?? 0,
-      eY_raw_m: lane.eY,
-      ePsi_raw_rad: lane.ePsi,
-      curvature_1pm: lane.curvature,
-      eY_kf_m: state.eY,
-      vY_kf_mps: state.vY,
-      ePsi_kf_rad: state.ePsi,
-      lane_width_m: tracker.locked ? lane.width : '',
-      matched: tracker.locked ? `${lane.matched.left ? 'L' : ''}${lane.matched.right ? 'R' : ''}` : '',
-      u_m: cmd.u,
-      zone: cmd.zone,
-      cue: cue.replace(/[◀▶]/g, '').trim(), // plain ASCII so spreadsheets open the CSV cleanly
-      motors: cmd.motors,
-      period_ms: cmd.periodMs,
-      L1: levels[0],
-      L2: levels[1],
-      L3: levels[2],
-      L4: levels[3],
-      L5: levels[4],
-      imu_age_ms: Number.isFinite(imuAgeMs) ? Math.round(imuAgeMs) : '',
-      fps,
-    }, performance.now());
+    showBelt(sent, cmd, performance.now(), beltOn ? cue : 'belt paused');
     const procMs = performance.now() - t0;
 
     const now = performance.now();
@@ -468,14 +408,30 @@ function run(cv, video) {
   frame();
 }
 
-// Mirrors the belt on screen: each box shows its motor's level and blinks with the 200 ms pulses
-// the firmware produces for that level.
-function showMotors(cmd, levels) {
-  const on = cmd.pattern !== Pattern.OFF && cmd.periodMs > 0 && performance.now() % cmd.periodMs < Math.min(200, (cmd.periodMs * 2) / 3);
-  [...$('motors').children].forEach((el, i) => {
-    el.textContent = levels[i] ? `M${i + 1} · ${levels[i]}` : `M${i + 1}`;
-    el.classList.toggle('on', on && levels[i] > 0);
+// Belt preview, same as replay.html: the firmware's pulse timing (level 0 off, 255 continuous,
+// 1..254 = 200 ms pulses, at most 2/3 of a period from 1000 ms at level 1 to 120 ms at level 254);
+// a motor's pulses start when its level turns on.
+const PULSE_ON_MS = 200;
+const periodForLevel = (lv) => 1000 - ((lv - 1) * (1000 - 120)) / 253;
+const motorEls = [1, 2, 3, 4, 5].map((n) => {
+  const el = document.createElement('div');
+  el.className = 'm';
+  el.innerHTML = `M${n}<small>-</small>`;
+  $('belt').appendChild(el);
+  return el;
+});
+const pulseStart = [null, null, null, null, null];
+function showBelt(levels, cmd, tMs, cue) {
+  const pattern = ['OFF', 'STEER', 'HEARTBEAT', 'STOP', 'CURVE'][cmd.pattern] ?? '';
+  levels.forEach((lv, i) => {
+    if (!lv) pulseStart[i] = null;
+    else if (pulseStart[i] === null || tMs < pulseStart[i]) pulseStart[i] = tMs;
+    const on = lv === 255 || (lv > 0 && (tMs - pulseStart[i]) % periodForLevel(lv) < Math.min(PULSE_ON_MS, (periodForLevel(lv) * 2) / 3));
+    const el = motorEls[i];
+    el.className = `m ${lv ? 'armed' : ''} ${on ? 'on' : ''} ${lv === 255 ? 'HEARTBEAT' : pattern} ${cmd.zone === 2 ? 'big' : ''}`;
+    el.querySelector('small').textContent = lv ? (lv === 255 ? 'on' : `${Math.round(periodForLevel(lv))} ms`) : '-';
   });
+  $('beltCue').textContent = cue || '';
 }
 
 // Point on the line at perpendicular offset y, distance t along the lane heading.
