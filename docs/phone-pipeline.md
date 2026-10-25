@@ -33,7 +33,7 @@ Recorded clips (52 s, 75 s) had no stalls; longer clips should confirm.
 - Service `06096ed2-b23b-4ba5-9737-27dba2053749`, peripheral name `LaneActuator`.
 - Command characteristic `14dd8746-dd9e-4308-8f98-08701035fc46` (write without response),
   7 bytes: `[seq lo, seq hi, L1, L2, L3, L4, L5]`.
-  - M1 big left, M2 small left, M3 straight heartbeat, M4 small right, M5 big right (pins D3, D5, D6, D9, D10).
+  - M1 big left, M2 small left, M3 straight heartbeat, M4 small right, M5 big right (pins D2..D6 by default, or A1..A5; see firmware/HANDOFF.md).
   - Level per motor: 0 = off, 255 = continuous, 1..254 = 60 ms pulses, period 1000 ms (level 1) -> 120 ms (level 254).
     The R4 generates the pulse timing; the phone only sends levels.
 - ACK characteristic `535f34b1-32f0-4532-97d1-18f2fff4bfbe` (notify): 2-byte seq echo, for RTT.
