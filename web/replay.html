@@ -58,6 +58,11 @@
   <span id="clipinfo"></span>
 </div>
 <div class="row"><div id="belt"></div><span id="beltCue"></span></div>
+<div class="row">
+  <button id="beltConnect">Connect belt (BLE: LaneActuator)</button>
+  <label><input type="checkbox" id="beltSend" checked> send the cues to the real belt</label>
+  <span id="beltInfo" style="font-size:12px;color:#aaa">Play at speed 1 (or slower) when feeling the belt; pausing stops it.</span>
+</div>
 <div style="font-size:12px;color:#888">M1 big left · M2 small left · M3 straight (heartbeat) · M4 small right · M5 big right
   — <span style="color:#30d158">heartbeat</span> <span style="color:#64d2ff">curve</span> <span style="color:#ffd60a">small turn</span> <span style="color:#ff453a">big turn / stop</span></div>
 <div class="views">
@@ -81,11 +86,11 @@ import { AttitudeBuffer, upFromOrientation, deviceToCamera } from './lane/ground
 import { LaneTracker, LaneStatus } from './lane/tracker.js';
 import { LaneEstimator, yawRateFromMotion } from './control/estimator.js';
 import { HapticController } from './control/controller.js';
-import { commandToLevels } from './control/protocol.js';
+import { commandToLevels, BeltLink } from './control/protocol.js';
 import { candidateLane, cueText, drawView, drawBev } from './lane/draw.js';
 import { setupTuning } from './control/tuning.js';
 
-const PAGE_VERSION = "replay-5";
+const PAGE_VERSION = "replay-6";
 const $ = (id) => document.getElementById(id);
 const log = (msg) => { $('log').textContent = `${msg}\n` + $('log').textContent; };
 window.addEventListener('error', (e) => log(`error: ${e.message}`));
@@ -298,6 +303,7 @@ function processFrame(mediaTime) {
   const procMs = performance.now() - t0;
   const cue = cueText(cmd, tracker.locked, !!candidate);
   updateBelt(levels, cmd, T, cue);
+  if (belt.connected && $('beltSend').checked) belt.send(levels);
 
   rows.push({
     t_s: +((T - rec.rec_start_t) / 1000).toFixed(3), status: lane.status, confidence: lane.confidence ?? 0,
@@ -398,6 +404,29 @@ function updateBelt(levels, cmd, tMs, cue) {
   });
   document.getElementById('beltCue').textContent = cue || '';
 }
+
+// ---------- Real belt (optional) ----------
+// The same BLE link as spike-ground.html: the cues computed for each video frame go to the belt, so
+// the vibration can be felt in sync with the recorded run. The board's 300 ms watchdog stops the
+// motors when playback pauses; an explicit all-off is sent on pause too.
+const belt = new BeltLink({
+  onLog: (m) => log(m),
+  onStatus: (text, ok) => {
+    $('beltConnect').textContent = text;
+    $('beltConnect').style.background = ok ? '#2d7' : '';
+  },
+});
+if (!navigator.bluetooth) {
+  $('beltConnect').disabled = true;
+  $('beltConnect').textContent = 'No Web Bluetooth here (open in Bluefy, or enable it in Chrome)';
+} else belt.restore().catch((e) => log(`belt restore: ${e.message || e}`));
+$('beltConnect').onclick = () => belt.choose().catch((e) => log(`belt: ${e.message || e}`));
+const beltAllOff = () => { if (belt.connected) belt.send([0, 0, 0, 0, 0]); };
+video.addEventListener('pause', beltAllOff);
+$('beltSend').onchange = () => { if (!$('beltSend').checked) beltAllOff(); };
+setInterval(() => {
+  if (belt.connected) $('beltInfo').textContent = `belt on · rtt ${belt.rttMs?.toFixed(0) ?? '-'} ms · writes ${belt.stats.writes} · skipped ${belt.stats.skipped}`;
+}, 1000);
 
 // ---------- Summary ----------
 const median = (a) => { if (!a.length) return NaN; const s = [...a].sort((x, y) => x - y); return s[s.length >> 1]; };
