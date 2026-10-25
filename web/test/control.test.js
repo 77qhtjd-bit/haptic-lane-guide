@@ -165,7 +165,8 @@ test('commands become per-motor levels: one motor, both outer motors for stop, z
   const steer = commandToLevels(ctl.step({ eY: 0.2 }, LaneStatus.INSIDE));
   assert.deepEqual(steer.map((l) => l > 0), [false, true, false, false, false]);
   assert.deepEqual(commandToLevels(ctl.step({ eY: 0 }, LaneStatus.INSIDE)), [0, 0, 1, 0, 0]); // heartbeat = slowest pulse
-  assert.deepEqual(commandToLevels(ctl.step({ eY: 0 }, LaneStatus.LOST)), [254, 0, 0, 0, 254]);
+  const stop = levelForPeriod(ctl.cfg.stopPeriodMs);
+  assert.deepEqual(commandToLevels(ctl.step({ eY: 0 }, LaneStatus.LOST)), [stop, 0, 0, 0, stop]);
   assert.deepEqual(commandToLevels(ctl.step({ eY: 0 }, LaneStatus.UNLOCKED)), [0, 0, 0, 0, 0]);
 });
 

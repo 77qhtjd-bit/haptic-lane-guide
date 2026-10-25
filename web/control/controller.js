@@ -33,12 +33,14 @@ export const DEFAULT_CONTROL_CONFIG = {
   hysteresis: 0.05, // m: leave a zone only this far below its entry threshold
   saturate: 0.6, // m of |u|: fastest pulses from here on
   slowPeriodMs: 600,
-  fastPeriodMs: 150,
+  // Fast patterns are 300-350 ms: the belt's coin motors need ~200 ms pulses to be felt (firmware
+  // PULSE_ON_MS), so 120-150 ms periods could not carry a felt pulse.
+  fastPeriodMs: 350,
   weakLevel: 170,
   strongLevel: 255,
   heartbeatPeriodMs: 1000,
   heartbeatLevel: 90,
-  stopPeriodMs: 120,
+  stopPeriodMs: 300,
   // Curve guidance (needs frame times): on a bend the runner must keep turning, so "centered" is
   // not silence/heartbeat but a gentle cue toward the bend on the small-turn motor (M2 for a left
   // bend, M4 right), announced by a short double tap. Measured on the real-track clips: bends read
@@ -53,7 +55,7 @@ export const DEFAULT_CONTROL_CONFIG = {
   curveHoldS: 0.5, // s: a new curve state must persist this long before it is used
   curvePeriodMs: 800, // gentle pulses while centered on a bend
   curveStartMs: 400, // the first curveStartMs of a bend: fast pulses (a double tap)
-  curveStartPeriodMs: 150,
+  curveStartPeriodMs: 350,
   // Cue dwell (needs frame times): a 0.1-0.3 s blip of another cue is one stray pulse that only
   // confuses the runner (jogging clip: 30 cue episodes under 0.3 s in 3 min, mostly small-left blips
   // on bends). A new cue is sent only after it has persisted cueConfirmS; a more urgent one

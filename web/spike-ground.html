@@ -468,10 +468,10 @@ function run(cv, video) {
   frame();
 }
 
-// Mirrors the belt on screen: each box shows its motor's level and blinks with the 60 ms pulses
+// Mirrors the belt on screen: each box shows its motor's level and blinks with the 200 ms pulses
 // the firmware produces for that level.
 function showMotors(cmd, levels) {
-  const on = cmd.pattern !== Pattern.OFF && cmd.periodMs > 0 && performance.now() % cmd.periodMs < 60;
+  const on = cmd.pattern !== Pattern.OFF && cmd.periodMs > 0 && performance.now() % cmd.periodMs < Math.min(200, (cmd.periodMs * 2) / 3);
   [...$('motors').children].forEach((el, i) => {
     el.textContent = levels[i] ? `M${i + 1} · ${levels[i]}` : `M${i + 1}`;
     el.classList.toggle('on', on && levels[i] > 0);

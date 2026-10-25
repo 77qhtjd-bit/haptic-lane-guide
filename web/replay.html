@@ -15,7 +15,7 @@
   #log { white-space: pre-wrap; font-family: ui-monospace, monospace; color: #f88; max-height: 120px; overflow: auto; }
   video { display: none; }
   h3 { margin: 10px 0 4px; font-size: 15px; color: #aaa; }
-  /* Belt preview: M1..M5 left to right as worn; lit during each firmware pulse (60 ms) at the
+  /* Belt preview: M1..M5 left to right as worn; lit during each firmware pulse (200 ms, <= 2/3 period) at the
      video's time. Colors: green heartbeat, cyan curve guidance, yellow small turn, red big turn/stop. */
   #belt { display: flex; gap: 6px; max-width: 480px; margin: 6px 0; }
   #belt .m { flex: 1; height: 54px; border-radius: 10px; background: #222; color: #777; display: flex; flex-direction: column;
@@ -379,9 +379,9 @@ function cueStats(rs) {
 }
 
 // ---------- Belt preview ----------
-// Same pulse timing as firmware/lane_actuator_ble: level 0 off, 255 continuous, 1..254 = 60 ms pulses
+// Same pulse timing as firmware/lane_actuator_ble: level 0 off, 255 continuous, 1..254 = 200 ms pulses (<= 2/3 period)
 // every 1000 ms (level 1) .. 120 ms (level 254); a motor's pulses start when its level turns on.
-const PULSE_ON_MS = 60;
+const PULSE_ON_MS = 200;
 const periodForLevel = (lv) => 1000 - ((lv - 1) * (1000 - 120)) / 253;
 const beltEl = document.getElementById('belt');
 const motorEls = [1, 2, 3, 4, 5].map((n) => {
@@ -397,7 +397,7 @@ function updateBelt(levels, cmd, tMs, cue) {
   levels.forEach((lv, i) => {
     if (!lv) pulseStart[i] = null;
     else if (pulseStart[i] === null || tMs < pulseStart[i]) pulseStart[i] = tMs;
-    const on = lv === 255 || (lv > 0 && (tMs - pulseStart[i]) % periodForLevel(lv) < PULSE_ON_MS);
+    const on = lv === 255 || (lv > 0 && (tMs - pulseStart[i]) % periodForLevel(lv) < Math.min(PULSE_ON_MS, (periodForLevel(lv) * 2) / 3));
     const el = motorEls[i];
     el.className = `m ${lv ? 'armed' : ''} ${on ? 'on' : ''} ${pattern} ${cmd.zone === 2 ? 'big' : ''}`;
     el.querySelector('small').textContent = lv ? `${lv} · ${Math.round(lv === 255 ? 0 : periodForLevel(lv))} ms` : '-';
