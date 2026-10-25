@@ -18,11 +18,25 @@
 
 // ---------- Settings ----------
 const int NUM_MOTORS = 5;
-const int MOTOR_PINS[NUM_MOTORS] = {3, 5, 6, 9, 10};   // PWM pins, M1..M5 (left to right)
-const int MOTOR_DUTY = 255;                 // PWM duty while a pulse is on (lower if motors are too strong)
+// Motor signal pins, M1..M5 = left to right. The Arduino drives these as OUTPUTS (they go to the
+// driver/vibration module signal input). Pick the set that matches the wiring:
+//   MOTOR_PINS_ANALOG_HEADER : A1, A2, A3, A4, A5
+//   otherwise (default)      : D2, D3, D4, D5, D6
+// #define MOTOR_PINS_ANALOG_HEADER
+#ifdef MOTOR_PINS_ANALOG_HEADER
+const int MOTOR_PINS[NUM_MOTORS] = {A1, A2, A3, A4, A5};
+#else
+const int MOTOR_PINS[NUM_MOTORS] = {2, 3, 4, 5, 6};
+#endif
+// Motors are switched fully on/off with digitalWrite, so any pin works (A1..A5, D2 and D4 have no
+// PWM). Strength is expressed by the pulse rate, not by PWM duty.
+const bool MOTOR_ACTIVE_HIGH = true;        // false if the driver turns the motor on with LOW
+// Pulse shape. A small DC motor or vibration module needs some time to spin up: if 60 ms pulses
+// feel weak or are not felt, raise PULSE_ON_MS (100-150 ms) and keep it below PULSE_PERIOD_MIN_MS.
+// The phone's level mapping (web/control/protocol.js) uses the same period range.
 const unsigned long PULSE_ON_MS = 60;
-const unsigned long PULSE_PERIOD_MAX_MS = 1000;   // level 1
-const unsigned long PULSE_PERIOD_MIN_MS = 120;    // level 254
+const unsigned long PULSE_PERIOD_MAX_MS = 1000;   // level 1   (slowest)
+const unsigned long PULSE_PERIOD_MIN_MS = 120;    // level 254 (fastest)
 const unsigned long WATCHDOG_MS = 300;
 
 #define SERVICE_UUID "06096ed2-b23b-4ba5-9737-27dba2053749"
@@ -54,7 +68,7 @@ unsigned long periodFor(uint8_t lv) {
 void setMotor(int i, bool on) {
   if (pulseOn[i] == on) return;
   pulseOn[i] = on;
-  analogWrite(MOTOR_PINS[i], on ? MOTOR_DUTY : 0);
+  digitalWrite(MOTOR_PINS[i], on == MOTOR_ACTIVE_HIGH ? HIGH : LOW);
   matrixDirty = true;
 }
 
@@ -132,7 +146,7 @@ void setup() {
 
   for (int i = 0; i < NUM_MOTORS; i++) {
     pinMode(MOTOR_PINS[i], OUTPUT);
-    analogWrite(MOTOR_PINS[i], 0);
+    digitalWrite(MOTOR_PINS[i], MOTOR_ACTIVE_HIGH ? LOW : HIGH);   // off
   }
   matrix.begin();
   drawMatrix();
@@ -152,6 +166,11 @@ void setup() {
   BLE.setEventHandler(BLEDisconnected, onDisconnect);
   BLE.advertise();
   Serial.println("Advertising as LaneActuator (5 motors)");
+#ifdef MOTOR_PINS_ANALOG_HEADER
+  Serial.println("Motor pins M1..M5: A1 A2 A3 A4 A5");
+#else
+  Serial.println("Motor pins M1..M5: D2 D3 D4 D5 D6");
+#endif
 }
 
 void loop() {
