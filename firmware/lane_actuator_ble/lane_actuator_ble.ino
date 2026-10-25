@@ -4,7 +4,7 @@
 // M3 straight "heartbeat", M4 small right turn, M5 big right turn.
 // The phone (Bluefy, Web Bluetooth) writes a 7-byte command [seq lo, seq hi, L1..L5].
 // Each level 0..255 sets that motor's pulse rate; the R4 generates the pulse timing:
-//   0 = off, 255 = continuously on, 1..254 = PULSE_ON_MS pulses whose period shrinks from
+//   0 = off, 255 = continuously on, 1..254 = PULSE_ON_MS pulses (<= 2/3 period) whose period shrinks from
 //   PULSE_PERIOD_MAX_MS (level 1) to PULSE_PERIOD_MIN_MS (level 254).
 // The board notifies the 2-byte seq back on the ACK characteristic (round-trip measurement).
 // Watchdog: no valid command for 300 ms (or phone disconnected) -> all motors off.
@@ -31,10 +31,12 @@ const int MOTOR_PINS[NUM_MOTORS] = {2, 3, 4, 5, 6};
 // Motors are switched fully on/off with digitalWrite, so any pin works (A1..A5, D2 and D4 have no
 // PWM). Strength is expressed by the pulse rate, not by PWM duty.
 const bool MOTOR_ACTIVE_HIGH = true;        // false if the driver turns the motor on with LOW
-// Pulse shape. A small DC motor or vibration module needs some time to spin up: if 60 ms pulses
-// feel weak or are not felt, raise PULSE_ON_MS (100-150 ms) and keep it below PULSE_PERIOD_MIN_MS.
+// Pulse shape. The coin vibration motors need time to spin up: on the belt 60/100/150 ms pulses felt
+// weak and 200 ms felt clearly (Oct 25 test). Each pulse is on for PULSE_ON_MS, but at most
+// PULSE_ON_MAX_PCT of its period so pulses never merge (the phone's fastest patterns are 300-350 ms).
 // The phone's level mapping (web/control/protocol.js) uses the same period range.
-const unsigned long PULSE_ON_MS = 60;
+const unsigned long PULSE_ON_MS = 200;
+const unsigned long PULSE_ON_MAX_PCT = 67;
 const unsigned long PULSE_PERIOD_MAX_MS = 1000;   // level 1   (slowest)
 const unsigned long PULSE_PERIOD_MIN_MS = 120;    // level 254 (fastest)
 const unsigned long WATCHDOG_MS = 300;
@@ -89,7 +91,8 @@ void updatePulses() {
     } else if (lv == 255) {
       setMotor(i, true);
     } else if (pulseOn[i]) {
-      if (now - pulseStart[i] >= PULSE_ON_MS) setMotor(i, false);
+      unsigned long onMs = min(PULSE_ON_MS, periodFor(lv) * PULSE_ON_MAX_PCT / 100);
+      if (now - pulseStart[i] >= onMs) setMotor(i, false);
     } else if (now - pulseStart[i] >= periodFor(lv)) {
       pulseStart[i] = now;
       setMotor(i, true);

@@ -34,7 +34,8 @@ Recorded clips (52 s, 75 s) had no stalls; longer clips should confirm.
 - Command characteristic `14dd8746-dd9e-4308-8f98-08701035fc46` (write without response),
   7 bytes: `[seq lo, seq hi, L1, L2, L3, L4, L5]`.
   - M1 big left, M2 small left, M3 straight heartbeat, M4 small right, M5 big right (pins D2..D6 by default, or A1..A5; see firmware/HANDOFF.md).
-  - Level per motor: 0 = off, 255 = continuous, 1..254 = 60 ms pulses, period 1000 ms (level 1) -> 120 ms (level 254).
+  - Level per motor: 0 = off, 255 = continuous, 1..254 = 200 ms pulses (at most 2/3 of the period), period 1000 ms (level 1) -> 120 ms (level 254).
+    The phone's patterns use 300-1000 ms periods: coin motors on the belt need ~200 ms pulses to be felt.
     The R4 generates the pulse timing; the phone only sends levels.
 - ACK characteristic `535f34b1-32f0-4532-97d1-18f2fff4bfbe` (notify): 2-byte seq echo, for RTT.
 - Watchdog: no valid command for 300 ms, or disconnect -> all motors off. The phone sends at ~15-20 Hz.

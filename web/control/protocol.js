@@ -3,7 +3,8 @@
 //
 // Command (write without response, ~20Hz), 7 bytes: [seq lo, seq hi, L1, L2, L3, L4, L5]
 //   M1 big left, M2 small left, M3 straight heartbeat, M4 small right, M5 big right.
-//   Level per motor: 0 = off, 255 = continuously on, 1..254 = 60 ms pulses whose period goes from
+//   Level per motor: 0 = off, 255 = continuously on, 1..254 = 200 ms pulses (at most 2/3 of the
+//   period, PULSE_ON_MS in the firmware) whose period goes from
 //   1000 ms (level 1) to 120 ms (level 254). The board generates the pulses.
 // ACK (notify), 2 bytes: the seq echoed back, used for round-trip time and stall detection.
 // Board watchdog: no command for 300 ms, or a disconnect -> all motors off.
