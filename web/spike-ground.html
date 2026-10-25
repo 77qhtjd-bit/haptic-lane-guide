@@ -35,6 +35,11 @@
   #belt .m small { font-weight: 400; font-size: 11px; }
   #belt .m { cursor: pointer; -webkit-tap-highlight-color: transparent; }
   .hint { color: #888; font-size: 12px; margin-top: 6px; }
+  #clipRow button { width: auto; flex: 1; font-size: 16px; padding: 12px; background: #444; color: #fff; }
+  #clipRow button.rec { background: #ff453a; }
+  #clipRow button:disabled { opacity: 0.4; }
+  #clipInfo { color: #aaa; font-size: 12px; }
+  #clipLinks a { color: #9cf; display: block; }
   #belt .m.armed { border-color: #666; color: #ccc; }
   /* Active motor between pulses: dim tint of its cue color, so the active motor is always visible. */
   #belt .m.armed.HEARTBEAT { background: #123d1d; } #belt .m.armed.CURVE { background: #12384a; }
@@ -57,6 +62,12 @@
 <div id="belt"></div>
 <div id="beltCue"></div>
 <button id="beltToggle">Belt ON (tap to pause)</button>
+<div class="row" id="clipRow">
+  <button id="clipRec" disabled>Record clip</button>
+  <button id="clipSave" disabled>Save clip</button>
+</div>
+<div id="clipInfo">Record clip: camera video + IMU of this run, for web/replay.html (after Start)</div>
+<div id="clipLinks"></div>
 <canvas id="view"></canvas>
 <div id="log"></div>
 <details class="adv"><summary>Advanced (line color, camera, tuning, debug)</summary>
@@ -96,6 +107,7 @@ import { LaneEstimator, yawRateFromMotion } from './control/estimator.js';
 import { HapticController, Pattern } from './control/controller.js';
 import { BeltLink, commandToLevels } from './control/protocol.js';
 import { setupTuning } from './control/tuning.js';
+import { ClipRecorder, saveFiles } from './control/clip.js';
 
 const $ = (id) => document.getElementById(id);
 const logEl = $('log');
@@ -142,6 +154,7 @@ window.addEventListener('deviceorientation', (e) => {
   lastOrientation = { beta: e.beta, gamma: e.gamma, t: performance.now() };
   upDevice = upFromOrientation(e.beta, e.gamma);
   attitude.push(performance.now(), deviceToCamera(upDevice));
+  clip?.onOrientation(e);
 });
 
 // Kalman prediction runs on every IMU sample; vision updates arrive per frame.
@@ -166,6 +179,7 @@ function predictTo(t, rate) {
   lastPredictT = t;
 }
 window.addEventListener('devicemotion', (e) => {
+  clip?.onMotion(e);
   const t = performance.now();
   if (!e.rotationRate || !upDevice) return;
   yawRate = yawRateFromMotion(e.rotationRate, upDevice);
@@ -188,6 +202,62 @@ $('beltToggle').onclick = () => {
   beltOn = !beltOn;
   $('beltToggle').textContent = beltOn ? 'Belt ON (tap to pause)' : 'Belt PAUSED (tap to resume)';
   $('beltToggle').classList.toggle('paused', !beltOn);
+  clip?.event(beltOn ? 'belt on' : 'belt paused');
+};
+
+// Clip recording for the replay demo: the run's camera video + IMU, saved like web/record.html.
+let clip = null; // ClipRecorder once the camera runs
+let clipFiles = null;
+let clipTimer = null;
+$('clipRec').onclick = async () => {
+  if (!clip) return;
+  if (!clip.recording) {
+    if (clipFiles && !confirm('The last clip has not been saved. Discard it?')) return;
+    clipFiles = null;
+    $('clipSave').disabled = true;
+    $('clipLinks').innerHTML = '';
+    try {
+      clip.start();
+    } catch (err) {
+      log(`clip: ${err.message || err}`);
+      return;
+    }
+    const t0 = performance.now();
+    $('clipRec').classList.add('rec');
+    clipTimer = setInterval(() => {
+      $('clipRec').textContent = `Stop clip (${((performance.now() - t0) / 1000).toFixed(0)} s)`;
+      if (!clip.recording) finishClip(clip.done);
+    }, 500);
+    log('clip recording');
+    return;
+  }
+  finishClip(clip.stop('manual'));
+};
+async function finishClip(done) {
+  clearInterval(clipTimer);
+  $('clipRec').disabled = true;
+  const out = await done;
+  $('clipRec').disabled = false;
+  $('clipRec').classList.remove('rec');
+  $('clipRec').textContent = 'Record clip';
+  if (!out) return;
+  clipFiles = out.files;
+  $('clipSave').disabled = false;
+  $('clipInfo').textContent = `${out.info}. Tap Save clip (both files), then open them in web/replay.html.`;
+  $('clipLinks').innerHTML = out.files.map((f) => `<a href="${URL.createObjectURL(f)}" download="${f.name}">Download ${f.name}</a>`).join('');
+}
+$('clipSave').onclick = async () => {
+  if (!clipFiles) return;
+  try {
+    if (await saveFiles(clipFiles)) {
+      log(`clip saved: ${clipFiles[0].name}`);
+      clipFiles = null;
+    } else {
+      log('no share sheet here: use the Download links');
+    }
+  } catch (err) {
+    if (err.name !== 'AbortError') log(`clip save failed (${err.name}): use the Download links`);
+  }
 };
 
 // Lock confirmation: two short taps on M3 (the runner cannot see the screen).
@@ -256,6 +326,12 @@ $('start').onclick = async () => {
     const video = $('video');
     video.srcObject = stream;
     await video.play();
+    if (ClipRecorder.supported()) {
+      clip = new ClipRecorder(stream, video);
+      $('clipRec').disabled = false;
+    } else {
+      $('clipInfo').textContent = 'Clip recording is not available in this browser (no MediaRecorder).';
+    }
     const { cv } = await loadCv();
     $('start').hidden = true;
     run(cv, video);
@@ -293,6 +369,7 @@ function run(cv, video) {
       estimator.reset(tracker.last.eY, tracker.last.ePsi);
       lastPredictT = performance.now();
       lockedAt = performance.now();
+      clip?.event('lock');
     }
     log(ok
       ? `locked: width ${(tracker.width * 100).toFixed(0)} cm`
