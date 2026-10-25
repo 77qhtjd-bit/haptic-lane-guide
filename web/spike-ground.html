@@ -260,13 +260,14 @@ $('clipSave').onclick = async () => {
   }
 };
 
-// Lock confirmation: two short taps on M3 (the runner cannot see the screen).
-const LOCK_TAPS = [[0, 200], [400, 600]]; // ms after the lock: motor on in these windows
+// Lock confirmation: two short taps on both small-turn motors (the runner cannot see the screen).
+// Not on M3: our belt has no center motor (not bought), so M3 cues are not felt.
+const LOCK_TAPS = [[0, 200], [400, 600]]; // ms after the lock: motors on in these windows
 let lockedAt = -Infinity;
 function lockTapLevels(now) {
   const dt = now - lockedAt;
   if (dt > LOCK_TAPS[LOCK_TAPS.length - 1][1]) return null;
-  return LOCK_TAPS.some(([a, b]) => dt >= a && dt < b) ? [0, 0, 255, 0, 0] : [0, 0, 0, 0, 0];
+  return LOCK_TAPS.some(([a, b]) => dt >= a && dt < b) ? [0, 255, 0, 255, 0] : [0, 0, 0, 0, 0];
 }
 
 // Keep the screen on while running: with the screen off iOS stops the camera.
