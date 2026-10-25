@@ -8,8 +8,8 @@ Built at Cal Hacks 13.0 (Oct 23-25, 2026).
 
 <table>
   <tr>
-    <td align="center"><img src="docs/images/run.gif" width="270" alt="Jogging on the track, seen by the chest-mounted iPhone"></td>
-    <td align="center"><img src="docs/images/app.gif" width="300" alt="The app: locked lane in green, curve cue, belt preview with M2 pulsing"></td>
+    <td align="center"><img src="docs/images/run.gif" width="240" alt="Jogging on the track, seen by the chest-mounted iPhone"></td>
+    <td align="center"><img src="docs/images/app.gif" width="270" alt="The app: locked lane in green, curve cue, belt preview with M2 pulsing"></td>
   </tr>
   <tr>
     <td align="center">What the chest-mounted phone sees (jogging, real track)</td>
@@ -75,6 +75,22 @@ Known limits: the start/finish area, with many crossing and diagonal lines, can 
 jump to the neighboring lane for a few seconds; white thresholds are tuned for daylight (they can be
 changed on the page); the numbers come from three clips recorded on one day on one track.
 
+## Try it: replay our jogging clip
+
+The jogging clip behind the numbers above is in [`samples/jogging/`](samples/jogging/) (3 min, video +
+IMU, recorded with the chest-mounted iPhone). No phone or belt needed:
+
+1. Open the [replay page with the clip loaded](https://sunuk00.github.io/haptic-lane-guide/web/replay.html?clip=../samples/jogging/rec_20261024-111904&out=94-97,103-110,158-160,174-178)
+   in desktop Chrome (the 58 MB clip takes a moment to load) and press play: the lane overlay, the
+   belt cue and the belt preview follow the run.
+2. **Step all frames** runs every frame and prints the score against the four times the runner really
+   left the lane (94-97 s, 103-110 s, 158-160 s, 174-178 s), the source of the table above.
+3. With a belt: **Connect belt** sends each frame's cue to it while the clip plays (on Linux enable
+   `chrome://flags/#enable-experimental-web-platform-features` first).
+
+Or download [`rec_20261024-111904.mp4`](samples/jogging/rec_20261024-111904.mp4) and
+[`.json`](samples/jogging/rec_20261024-111904.json) and pick both files on the replay page.
+
 ## Using it
 
 The pages need HTTPS (camera, motion sensors, Web Bluetooth) and are served by GitHub Pages. On the
@@ -109,7 +125,9 @@ preview, and it can drive the real belt for indoor demos); `laptop/` holds the t
 
 ## Hardware
 
-<!-- Hardware photo: docs/images/belt.jpg -->
+<p align="center"><img src="docs/images/hardware.jpg" width="420" alt="Chest harness with a 3D-printed phone mount (left) and the waist belt with coin vibration motors and breadboard wiring (right)"></p>
+<p align="center">Left: chest harness with our 3D-printed phone mount. Right: the waist belt, coin motors (two per side) wired through a breadboard to the Arduino.</p>
+
 
 - Arduino UNO R4 WiFi and coin vibration motors around the waist: M1, M2 on the left, M4, M5 on the
   right, switched from pins D2-D6 (or A1-A5, one `#define` in the sketch). The center motor M3 is in
