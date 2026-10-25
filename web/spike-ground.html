@@ -488,6 +488,7 @@ function cueText(cmd, locked, found) {
   if (!locked) return found ? 'LANE FOUND' : 'NO LANE';
   if (cmd.pattern === Pattern.STOP) return 'STOP';
   if (cmd.pattern === Pattern.HEARTBEAT) return 'STRAIGHT';
+  if (cmd.pattern === Pattern.CURVE) return cmd.motors & 0b00011 ? '◀ CURVE' : 'CURVE ▶';
   if (cmd.pattern === Pattern.STEER) return cmd.motors & 0b00011 ? '◀ LEFT' : 'RIGHT ▶';
   return '';
 }

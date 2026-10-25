@@ -197,3 +197,38 @@ test('controller: a steady heading offset (camera mounted turned) is learned, a 
   for (let i = 1; i <= 30; i++) cmd = ctl.step({ eY: 0.3, vY: 0, ePsi: 12 * DEG }, LaneStatus.INSIDE, 0, 60000 + (i * 1000) / 30);
   assert.equal(cmd.motors, motorBit(2));
 });
+
+test('curve guidance: centered on a left bend gives a double tap, then gentle pulses on M2; a straight gives the heartbeat', () => {
+  const ctl = new HapticController();
+  const at = (i, curvature) => ctl.step({ eY: 0, vY: 0, ePsi: 0 }, LaneStatus.INSIDE, curvature, (i * 1000) / 30);
+  let cmd;
+  for (let i = 0; i < 30; i++) cmd = at(i, 0); // 1 s straight
+  assert.equal(cmd.pattern, Pattern.HEARTBEAT);
+  const cues = [];
+  for (let i = 30; i < 150; i++) cues.push(at(i, -1 / 40)); // track bend to the left (R 40 m)
+  const first = cues.findIndex((c) => c.pattern === Pattern.CURVE);
+  assert.ok(first >= 0 && first <= 30, `curve cue within ~1 s (frame ${first})`);
+  assert.equal(cues[first].motors, motorBit(2));
+  assert.equal(cues[first].periodMs, ctl.cfg.curveStartPeriodMs); // double tap at the start
+  const last = cues[cues.length - 1];
+  assert.equal(last.pattern, Pattern.CURVE);
+  assert.equal(last.periodMs, ctl.cfg.curvePeriodMs);
+  for (let i = 150; i < 240; i++) cmd = at(i, 0); // back on a straight
+  assert.equal(cmd.pattern, Pattern.HEARTBEAT);
+});
+
+test('curve guidance: drifting outward on the bend strengthens the left cue; right bends are ignored by default', () => {
+  const ctl = new HapticController();
+  let cmd;
+  for (let i = 0; i < 90; i++) cmd = ctl.step({ eY: 0, vY: 0, ePsi: 0 }, LaneStatus.INSIDE, -1 / 40, (i * 1000) / 30);
+  assert.equal(cmd.pattern, Pattern.CURVE);
+  for (let i = 90; i < 150; i++) cmd = ctl.step({ eY: 0.45, vY: 0, ePsi: 0 }, LaneStatus.INSIDE, -1 / 40, (i * 1000) / 30);
+  assert.equal(cmd.pattern, Pattern.STEER);
+  assert.equal(cmd.motors, motorBit(1)); // runner 45 cm right of center (outside of a left bend): big left
+  const right = new HapticController();
+  for (let i = 0; i < 90; i++) cmd = right.step({ eY: 0, vY: 0, ePsi: 0 }, LaneStatus.INSIDE, 1 / 40, (i * 1000) / 30);
+  assert.equal(cmd.pattern, Pattern.HEARTBEAT);
+  const both = new HapticController({ curveSides: 0 });
+  for (let i = 0; i < 90; i++) cmd = both.step({ eY: 0, vY: 0, ePsi: 0 }, LaneStatus.INSIDE, 1 / 40, (i * 1000) / 30);
+  assert.equal(cmd.motors, motorBit(4));
+});

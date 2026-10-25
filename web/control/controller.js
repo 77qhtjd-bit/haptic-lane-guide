@@ -7,7 +7,7 @@
 
 import { LaneStatus } from '../lane/tracker.js';
 
-export const Pattern = Object.freeze({ OFF: 0, STEER: 1, HEARTBEAT: 2, STOP: 3 });
+export const Pattern = Object.freeze({ OFF: 0, STEER: 1, HEARTBEAT: 2, STOP: 3, CURVE: 4 });
 
 export const motorBit = (n) => 1 << (n - 1);
 
@@ -39,6 +39,21 @@ export const DEFAULT_CONTROL_CONFIG = {
   heartbeatPeriodMs: 1000,
   heartbeatLevel: 90,
   stopPeriodMs: 120,
+  // Curve guidance (needs frame times): on a bend the runner must keep turning, so "centered" is
+  // not silence/heartbeat but a gentle cue toward the bend on the small-turn motor (M2 for a left
+  // bend, M4 right), announced by a short double tap. Measured on the real-track clips: bends read
+  // |curvature| 0.015-0.024 /m, straights under 0.005 /m; the camera sees the bend ~1-1.5 s ahead.
+  curveGuide: 1, // 0 = off (centered on a bend gives the heartbeat, as before)
+  // Track running is counterclockwise, so bends are left; guiding only left bends halved the false
+  // curve cues on straights (7.9 -> 3.9 s/min on the clips) without delaying any bend. 0 = both.
+  curveSides: -1,
+  curveOnK: 0.0125, // 1/m (R 80 m): averaged curvature above this starts curve guidance
+  curveOffK: 0.0067, // 1/m (R 150 m): below this it ends; in between the state is kept
+  curveAvgS: 1, // s: curvature averaging window
+  curveHoldS: 0.5, // s: a new curve state must persist this long before it is used
+  curvePeriodMs: 800, // gentle pulses while centered on a bend
+  curveStartMs: 400, // the first curveStartMs of a bend: fast pulses (a double tap)
+  curveStartPeriodMs: 150,
 };
 
 export class HapticController {
@@ -53,6 +68,30 @@ export class HapticController {
     this.history = []; // { t, eY, ePsi } over the last max(positionAvgS, headingAvgS) seconds
     this.headingBias = 0;
     this.lastT = null;
+    this.curveHist = []; // { t, k }
+    this.curveSide = 0; // -1 left bend, +1 right bend, 0 straight
+    this.curvePending = null;
+    this.curvePendingSince = 0;
+    this.curveStartUntil = 0;
+  }
+
+  // Curve state from the averaged curvature with on/off thresholds and a hold time.
+  updateCurve(curvature, tMs) {
+    const c = this.cfg;
+    this.curveHist.push({ t: tMs, k: curvature || 0 });
+    while (this.curveHist.length && this.curveHist[0].t < tMs - c.curveAvgS * 1000) this.curveHist.shift();
+    const k = this.curveHist.reduce((acc, h) => acc + h.k, 0) / this.curveHist.length;
+    let want = this.curveSide;
+    if (Math.abs(k) >= c.curveOnK) want = Math.sign(k);
+    else if (Math.abs(k) <= c.curveOffK) want = 0;
+    if (c.curveSides && want !== 0 && want !== c.curveSides) want = 0;
+    if (want === this.curveSide) { this.curvePending = null; return; }
+    if (this.curvePending !== want) { this.curvePending = want; this.curvePendingSince = tMs; return; }
+    if (tMs - this.curvePendingSince >= c.curveHoldS * 1000) {
+      if (want !== 0) this.curveStartUntil = tMs + c.curveStartMs;
+      this.curveSide = want;
+      this.curvePending = null;
+    }
   }
 
   // Averages eY and ePsi over their windows ending at tMs, and learns the steady heading offset.
@@ -120,6 +159,7 @@ export class HapticController {
     }
 
     const f = this.filtered(state, tMs);
+    if (c.curveGuide && tMs != null) this.updateCurve(curvature, tMs);
     this.lastAim = this.aimPoint({ ...state, eY: f.eY, ePsi: f.ePsi }, curvature); // what the cue steers toward (for drawing)
     const u = this.effort({ ...state, eY: f.eY, ePsi: f.ePsi }, curvature);
     let goLeft = u > 0;
@@ -133,6 +173,18 @@ export class HapticController {
     }
     if (lowConfidence) this.zone = Math.min(this.zone, 1);
 
+    if (this.zone === 0 && c.curveGuide && tMs != null && this.curveSide !== 0) {
+      // Centered on a bend: keep turning, gently, on the small-turn motor toward the bend.
+      return {
+        pattern: Pattern.CURVE,
+        motors: motorBit(this.curveSide < 0 ? 2 : 4),
+        level: c.weakLevel,
+        periodMs: tMs < this.curveStartUntil ? c.curveStartPeriodMs : c.curvePeriodMs,
+        zone: 0,
+        u,
+        curve: this.curveSide,
+      };
+    }
     if (this.zone === 0) {
       return {
         pattern: Pattern.HEARTBEAT,
