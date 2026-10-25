@@ -75,6 +75,7 @@
   <label>manual γ <input id="mgamma" type="number" step="1" value="0"></label>
   <span>(used only when the device sends no orientation, e.g. a laptop webcam)</span>
 </div>
+<div id="overrides" style="font-size:12px;color:#9cf"></div>
 <div id="log"></div>
 <video id="video" playsinline muted></video>
 <canvas id="proc" hidden></canvas>
@@ -93,6 +94,25 @@ import { AudioCue } from './control/audio.js';
 const $ = (id) => document.getElementById(id);
 const logEl = $('log');
 const log = (msg) => { logEl.textContent = `${new Date().toLocaleTimeString()} ${msg}\n` + logEl.textContent; };
+
+// Settings from the address, same as web/replay.html, to switch rules on and off on the phone:
+//   ?t_<key>=v  tracker (DEFAULT_TRACKER_CONFIG), e.g. t_verifySlope=0 turns the line check off
+//   ?c_<key>=v  haptic controller (DEFAULT_CONTROL_CONFIG), e.g. c_deadband=0.15
+//   ?h=1.5&hfov=53&vmin=180&smax=60&lag=50&laneMin=0.6&laneMax=1.3  the inputs below
+const urlParams = new URLSearchParams(location.search);
+const trackerOverrides = {};
+const controlOverrides = {};
+for (const [k, v] of urlParams) {
+  if (k.startsWith('t_')) trackerOverrides[k.slice(2)] = +v;
+  if (k.startsWith('c_')) controlOverrides[k.slice(2)] = +v;
+}
+for (const id of ['h', 'hfov', 'vmin', 'smax', 'lag', 'laneMin', 'laneMax']) if (urlParams.get(id)) $(id).value = urlParams.get(id);
+{
+  const shown = [...Object.entries(trackerOverrides).map(([k, v]) => `tracker.${k}=${v}`),
+                 ...Object.entries(controlOverrides).map(([k, v]) => `control.${k}=${v}`)];
+  $('overrides').textContent = shown.length ? `settings from the address: ${shown.join('  ')}` : 'all rules at their defaults';
+  if (shown.length) log(`settings from the address: ${shown.join(', ')}`);
+}
 window.addEventListener('error', (e) => log(`error: ${e.message}`));
 window.addEventListener('unhandledrejection', (e) => log(`rejection: ${e.reason}`));
 
@@ -128,7 +148,7 @@ window.addEventListener('deviceorientation', (e) => {
 // (without yaw rate), and vision measured with the stale attitude counts for less.
 const IMU_STALE_MS = 100;
 const estimator = new LaneEstimator();
-const controller = new HapticController();
+const controller = new HapticController(controlOverrides);
 let lastMotionT = -Infinity;
 let lastPredictT = null;
 let yawRate = 0;
@@ -289,7 +309,7 @@ function run(cv, video) {
   let fps = 0;
   let prevHeading = 0;
   let latest = null;
-  const tracker = new LaneTracker();
+  const tracker = new LaneTracker(trackerOverrides);
   $('lock').hidden = false;
   $('lock').onclick = () => {
     const ok = latest?.ok && tracker.lock(latest.peaks, latest.heading, latest.segments);
