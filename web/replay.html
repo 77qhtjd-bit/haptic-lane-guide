@@ -419,6 +419,9 @@ const belt = new BeltLink({
 if (!navigator.bluetooth) {
   $('beltConnect').disabled = true;
   $('beltConnect').textContent = 'No Web Bluetooth here (open in Bluefy, or enable it in Chrome)';
+  // Desktop Chrome on Linux ships Web Bluetooth behind a flag (checked Oct 25, Chrome 155).
+  log('Belt from this computer: open chrome://flags/#enable-experimental-web-platform-features, set it to Enabled, ' +
+      'Relaunch, then reload this page. Close Bluefy on the phone first (the belt takes one connection).');
 } else belt.restore().catch((e) => log(`belt restore: ${e.message || e}`));
 $('beltConnect').onclick = () => belt.choose().catch((e) => log(`belt: ${e.message || e}`));
 const beltAllOff = () => { if (belt.connected) belt.send([0, 0, 0, 0, 0]); };
