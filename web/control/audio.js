@@ -36,7 +36,7 @@ export class AudioCue {
     else if (cmd.pattern === Pattern.STOP) {
       freq = PITCH_HZ.stop;
       pan = Math.floor(nowMs / cmd.periodMs) % 2 ? 1 : -1; // alternate ears
-    } else if (cmd.pattern === Pattern.STEER) {
+    } else if (cmd.pattern === Pattern.STEER || cmd.pattern === Pattern.CURVE) {
       freq = cmd.zone === 2 ? PITCH_HZ.strong : PITCH_HZ.weak;
       pan = PAN[Math.log2(cmd.motors & -cmd.motors)] ?? 0;
     }
