@@ -61,7 +61,7 @@ export const DEFAULT_CONTROL_CONFIG = {
   // cueHoldS (one pulse at least) before a calmer one replaces it. 0 = off for each.
   cueConfirmS: 0.35, // 0.4 delayed one real departure warning to 0.52 s; 0.35 kept all <= 0.49 s, blips still 0
   cueEscalateS: 0.15,
-  cueHoldS: 0.8,
+  cueHoldS: 1.5, // 0.8 still allowed straight-left-straight in 0.8 s steps; 1.5 measured: cues < 1.5 s 16 -> 4, warning delays unchanged
 };
 
 // Urgency of a command for the cue dwell: calm cues < small turn < big turn < stop.
